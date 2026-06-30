@@ -257,6 +257,16 @@ def split_file_key(key: str) -> FileKey:
     return dev, ino
 
 
+def make_file_pid_key(file_key: str, pid_name: str) -> str:
+    return f"{file_key}\u001f{pid_name}"
+
+
+def split_file_pid_key(key: str) -> Tuple[str, str]:
+    if "\u001f" not in key:
+        return key, ""
+    return tuple(key.split("\u001f", 1))  # type: ignore[return-value]
+
+
 def load_candidate_pages(
     conn: sqlite3.Connection,
     max_lanes: int,
@@ -345,12 +355,14 @@ def pass_for_peaks(
     end_ts: float,
     bucket_seconds: float,
     mapping: Dict[FileKey, Dict[str, object]],
-) -> Tuple[List[str], List[str], Dict[str, object]]:
+) -> Tuple[List[str], List[str], List[str], Dict[str, object]]:
     active: Dict[PageKey, Tuple[str, str]] = {}
     by_file: collections.Counter = collections.Counter()
     by_pid: collections.Counter = collections.Counter()
+    by_file_pid: collections.Counter = collections.Counter()
     peak_file: collections.Counter = collections.Counter()
     peak_pid: collections.Counter = collections.Counter()
+    peak_file_pid: collections.Counter = collections.Counter()
     anomalies = collections.Counter()
     total_events = 0
     next_bucket = start_ts
@@ -362,6 +374,9 @@ def pass_for_peaks(
         for key, value in by_pid.items():
             if value > peak_pid[key]:
                 peak_pid[key] = value
+        for key, value in by_file_pid.items():
+            if value > peak_file_pid[key]:
+                peak_file_pid[key] = value
 
     for ts, _sort, kind, dev, ino, ofs, pid_name in iter_events(
         conn,
@@ -385,10 +400,12 @@ def pass_for_peaks(
                 old_file, old_pid = active[page_key]
                 by_file[old_file] -= 1
                 by_pid[old_pid] -= 1
+                by_file_pid[make_file_pid_key(old_file, old_pid)] -= 1
                 anomalies["duplicate_add_closed_previous"] += 1
             active[page_key] = (file_key, pid)
             by_file[file_key] += 1
             by_pid[pid] += 1
+            by_file_pid[make_file_pid_key(file_key, pid)] += 1
         elif kind == "delete":
             old = active.pop(page_key, None)
             if old is None:
@@ -397,6 +414,7 @@ def pass_for_peaks(
                 old_file, old_pid = old
                 by_file[old_file] -= 1
                 by_pid[old_pid] -= 1
+                by_file_pid[make_file_pid_key(old_file, old_pid)] -= 1
         elif kind == "access":
             old = active.get(page_key)
             if old is None:
@@ -406,6 +424,8 @@ def pass_for_peaks(
                 if pid != old_pid:
                     by_pid[old_pid] -= 1
                     by_pid[pid] += 1
+                    by_file_pid[make_file_pid_key(old_file, old_pid)] -= 1
+                    by_file_pid[make_file_pid_key(old_file, pid)] += 1
                     active[page_key] = (old_file, pid)
 
     while next_bucket <= end_ts + 1e-9:
@@ -414,13 +434,14 @@ def pass_for_peaks(
 
     top_files = [k for k, _v in peak_file.most_common(args.max_groups)]
     top_pids = [k for k, _v in peak_pid.most_common(args.max_groups)]
+    top_file_pids = [k for k, _v in peak_file_pid.most_common(args.max_groups)]
     stats = {
         "totalEvents": total_events,
         "openPagesAtEnd": len(active),
         "anomalies": dict(anomalies),
         "peakResidentPages": int(sum(max(v, 0) for v in by_file.values())),
     }
-    return top_files, top_pids, stats
+    return top_files, top_pids, top_file_pids, stats
 
 
 def reconstruct(
@@ -432,35 +453,45 @@ def reconstruct(
     mapping: Dict[FileKey, Dict[str, object]],
     top_files: Sequence[str],
     top_pids: Sequence[str],
+    top_file_pids: Sequence[str],
     candidate_pages: Sequence[PageKey],
 ) -> Dict[str, object]:
     active: Dict[PageKey, Dict[str, object]] = {}
     by_file: collections.Counter = collections.Counter()
     by_pid: collections.Counter = collections.Counter()
+    by_file_pid: collections.Counter = collections.Counter()
     anomalies = collections.Counter()
     series: List[Dict[str, object]] = []
     lanes: Dict[PageKey, Dict[str, object]] = {}
     lane_order = {page: i for i, page in enumerate(candidate_pages)}
     top_file_set = set(top_files)
     top_pid_set = set(top_pids)
+    top_file_pid_set = set(top_file_pids)
     next_bucket = start_ts
     total_events = 0
 
     def emit_snapshot(ts: float) -> None:
         other_file = sum(max(0, v) for k, v in by_file.items() if k not in top_file_set)
         other_pid = sum(max(0, v) for k, v in by_pid.items() if k not in top_pid_set)
+        other_file_pid = sum(
+            max(0, v) for k, v in by_file_pid.items() if k not in top_file_pid_set
+        )
         by_file_payload = {k: int(max(0, by_file[k])) for k in top_files}
         by_pid_payload = {k: int(max(0, by_pid[k])) for k in top_pids}
+        by_file_pid_payload = {k: int(max(0, by_file_pid[k])) for k in top_file_pids}
         if other_file:
             by_file_payload["__other__"] = int(other_file)
         if other_pid:
             by_pid_payload["__other__"] = int(other_pid)
+        if other_file_pid:
+            by_file_pid_payload["__other__"] = int(other_file_pid)
         series.append(
             {
                 "t": round(ts, 6),
                 "total": int(sum(max(0, v) for v in by_file.values())),
                 "byFile": by_file_payload,
                 "byPid": by_pid_payload,
+                "byFilePid": by_file_pid_payload,
             }
         )
 
@@ -539,6 +570,7 @@ def reconstruct(
                 old = active[page_key]
                 by_file[old["fileKey"]] -= 1
                 by_pid[old["pidName"]] -= 1
+                by_file_pid[make_file_pid_key(old["fileKey"], old["pidName"])] -= 1
                 anomalies["duplicate_add_closed_previous"] += 1
             active[page_key] = {
                 "fileKey": file_key,
@@ -549,6 +581,7 @@ def reconstruct(
             }
             by_file[file_key] += 1
             by_pid[pid] += 1
+            by_file_pid[make_file_pid_key(file_key, pid)] += 1
             add_lane_event(page_key, ts, "add", pid)
         elif kind == "delete":
             state = active.get(page_key)
@@ -559,6 +592,7 @@ def reconstruct(
                 close_lane_segment(page_key, ts, "delete")
                 by_file[state["fileKey"]] -= 1
                 by_pid[state["pidName"]] -= 1
+                by_file_pid[make_file_pid_key(state["fileKey"], state["pidName"])] -= 1
                 active.pop(page_key, None)
         elif kind == "access":
             state = active.get(page_key)
@@ -571,6 +605,8 @@ def reconstruct(
                     close_lane_segment(page_key, ts, "pid_change")
                     by_pid[state["pidName"]] -= 1
                     by_pid[pid] += 1
+                    by_file_pid[make_file_pid_key(state["fileKey"], state["pidName"])] -= 1
+                    by_file_pid[make_file_pid_key(state["fileKey"], pid)] += 1
                     state["pidName"] = pid
                     state["segmentStart"] = ts
 
@@ -583,7 +619,8 @@ def reconstruct(
             close_lane_segment(page_key, end_ts, "still_resident_at_end")
 
     file_meta = {}
-    for key in set(top_files) | {lane["fileKey"] for lane in lanes.values()}:
+    file_keys_from_file_pid = {split_file_pid_key(key)[0] for key in top_file_pids if key != "__other__"}
+    for key in set(top_files) | file_keys_from_file_pid | {lane["fileKey"] for lane in lanes.values()}:
         if key == "__other__":
             continue
         dev, ino = split_file_key(key)
@@ -594,6 +631,13 @@ def reconstruct(
             "filename": meta.get("filename") or key,
             "size": meta.get("size", 0),
         }
+
+    def file_pid_label(key: str) -> str:
+        if key == "__other__":
+            return "Other file + pid_name"
+        file_key, pid = split_file_pid_key(key)
+        file_name = file_meta.get(file_key, {}).get("filename", file_key)
+        return f"{file_name} · {pid or 'unknown'}"
 
     ordered_lanes = [
         lanes[key]
@@ -617,6 +661,8 @@ def reconstruct(
             + ([{"key": "__other__", "label": "Other files"}] if any("__other__" in s["byFile"] for s in series) else []),
             "pids": [{"key": k, "label": k} for k in top_pids]
             + ([{"key": "__other__", "label": "Other pid_name"}] if any("__other__" in s["byPid"] for s in series) else []),
+            "filePids": [{"key": k, "label": file_pid_label(k)} for k in top_file_pids]
+            + ([{"key": "__other__", "label": "Other file + pid_name"}] if any("__other__" in s["byFilePid"] for s in series) else []),
         },
         "fileMeta": file_meta,
         "series": series,
@@ -684,7 +730,7 @@ button {
   background: transparent;
   color: var(--muted);
   padding: 8px 11px;
-  min-width: 72px;
+  min-width: 76px;
   border-radius: 6px;
   font-size: 13px;
   cursor: pointer;
@@ -783,6 +829,7 @@ canvas {
     <div class="segmented" aria-label="color mode">
       <button id="modeFile" class="active" type="button">文件颜色</button>
       <button id="modePid" type="button">pid_name 颜色</button>
+      <button id="modeFilePid" type="button">文件+pid</button>
     </div>
     <input id="search" type="search" placeholder="过滤生命周期条带：filename / pid_name / dev:ino:ofs">
   </div>
@@ -840,11 +887,27 @@ function resizeCanvas(canvas) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   return { ctx, w: rect.width, h: rect.height };
 }
+function filePidKey(fileKey, pidName) {
+  return `${fileKey}\u001f${pidName || 'unknown'}`;
+}
 function groupList() {
-  return mode === 'file' ? data.groups.files : data.groups.pids;
+  if (mode === 'file') return data.groups.files;
+  if (mode === 'pid') return data.groups.pids;
+  return data.groups.filePids || [];
 }
 function seriesBucket(s) {
-  return mode === 'file' ? s.byFile : s.byPid;
+  if (mode === 'file') return s.byFile;
+  if (mode === 'pid') return s.byPid;
+  return s.byFilePid || {};
+}
+function modeLabel() {
+  if (mode === 'file') return '按文件分组';
+  if (mode === 'pid') return '按 pid_name 分组';
+  return '按文件 + pid_name 分组';
+}
+function labelForKey(key) {
+  const found = groupList().find(g => g.key === key);
+  return found ? found.label : key;
 }
 function installStats() {
   const m = data.metadata;
@@ -893,6 +956,7 @@ function drawSummary() {
   }
   const groups = groupList().map(g => g.key);
   const bases = new Array(data.series.length).fill(0);
+  window.__summaryChart = { pad, w, h, iw, ih, start, end, maxY };
   for (const key of groups) {
     ctx.beginPath();
     for (let i = 0; i < data.series.length; i++) {
@@ -923,7 +987,7 @@ function drawSummary() {
   ctx.textAlign = 'right';
   ctx.fillText(timeFmt(end), w - pad.r, h - 9);
   ctx.textAlign = 'left';
-  document.getElementById('summaryLabel').textContent = mode === 'file' ? '按文件分组' : '按 pid_name 分组';
+  document.getElementById('summaryLabel').textContent = modeLabel();
 }
 function filteredLanes() {
   const q = filter.trim().toLowerCase();
@@ -973,7 +1037,7 @@ function drawLife() {
     for (const seg of lane.segments || []) {
       const x1 = pad.l + ((seg.start - start) / Math.max(end - start, .001)) * iw;
       const x2 = pad.l + ((seg.end - start) / Math.max(end - start, .001)) * iw;
-      const colorKey = mode === 'file' ? seg.fileKey : seg.pidName;
+      const colorKey = mode === 'file' ? seg.fileKey : (mode === 'pid' ? seg.pidName : filePidKey(seg.fileKey, seg.pidName));
       ctx.fillStyle = keyColor(colorKey);
       ctx.globalAlpha = .86;
       ctx.fillRect(Math.max(pad.l, x1), y + 2, Math.max(1, x2 - x1), Math.max(4, rowH - 4));
@@ -1012,19 +1076,69 @@ function drawLegend() {
   ).join('');
 }
 function redraw() { drawSummary(); drawLegend(); drawLife(); }
-document.getElementById('modeFile').onclick = () => {
-  mode = 'file';
-  document.getElementById('modeFile').classList.add('active');
-  document.getElementById('modePid').classList.remove('active');
+function setMode(nextMode) {
+  mode = nextMode;
+  document.getElementById('modeFile').classList.toggle('active', mode === 'file');
+  document.getElementById('modePid').classList.toggle('active', mode === 'pid');
+  document.getElementById('modeFilePid').classList.toggle('active', mode === 'filePid');
   redraw();
+}
+document.getElementById('modeFile').onclick = () => {
+  setMode('file');
 };
 document.getElementById('modePid').onclick = () => {
-  mode = 'pid';
-  document.getElementById('modePid').classList.add('active');
-  document.getElementById('modeFile').classList.remove('active');
-  redraw();
+  setMode('pid');
+};
+document.getElementById('modeFilePid').onclick = () => {
+  setMode('filePid');
 };
 document.getElementById('search').oninput = (e) => { filter = e.target.value; drawLife(); };
+document.getElementById('summaryCanvas').addEventListener('mousemove', (e) => {
+  const tip = document.getElementById('tip');
+  const chart = window.__summaryChart;
+  if (!chart || !data.series?.length) { tip.style.display = 'none'; return; }
+  const rect = e.currentTarget.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  const {pad, iw, ih, start, end, maxY} = chart;
+  if (x < pad.l || x > rect.width - pad.r || y < pad.t || y > rect.height - pad.b) {
+    tip.style.display = 'none';
+    return;
+  }
+  const t = start + ((x - pad.l) / Math.max(iw, 1)) * Math.max(end - start, .001);
+  let index = 0;
+  let best = Infinity;
+  for (let i = 0; i < data.series.length; i++) {
+    const delta = Math.abs(data.series[i].t - t);
+    if (delta < best) { best = delta; index = i; }
+  }
+  const s = data.series[index];
+  const targetValue = maxY * (1 - (y - pad.t) / Math.max(ih, 1));
+  let base = 0;
+  let hitKey = null;
+  let hitCount = 0;
+  for (const g of groupList()) {
+    const count = seriesBucket(s)[g.key] || 0;
+    if (count > 0 && targetValue >= base && targetValue <= base + count) {
+      hitKey = g.key;
+      hitCount = count;
+      break;
+    }
+    base += count;
+  }
+  const label = hitKey ? labelForKey(hitKey) : 'total resident pages';
+  const pct = s.total ? (hitCount * 100 / s.total).toFixed(1) : '0.0';
+  tip.innerHTML = `<b>${escapeHtml(modeLabel())}</b><br>` +
+    `<span class="muted">${timeFmt(s.t)} · bucket ${index + 1}/${data.series.length}</span><br>` +
+    `${escapeHtml(label)}<br>` +
+    `pages: <b>${fmt(hitKey ? hitCount : s.total)}</b>` +
+    (hitKey ? ` · total: ${fmt(s.total)} · ${pct}%` : '');
+  tip.style.left = Math.min(window.innerWidth - 540, e.clientX + 14) + 'px';
+  tip.style.top = Math.min(window.innerHeight - 120, e.clientY + 14) + 'px';
+  tip.style.display = 'block';
+});
+document.getElementById('summaryCanvas').addEventListener('mouseleave', () => {
+  document.getElementById('tip').style.display = 'none';
+});
 document.getElementById('lifeCanvas').addEventListener('mousemove', (e) => {
   const tip = document.getElementById('tip');
   const rect = e.currentTarget.getBoundingClientRect();
@@ -1093,7 +1207,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--max-groups",
         type=int,
         default=24,
-        help="Top files and top pid_name groups to color in the aggregate chart.",
+        help="Top files, pid_name, and file+pid_name groups to color in the aggregate chart.",
     )
     parser.add_argument(
         "--max-lanes",
@@ -1164,11 +1278,12 @@ def main(argv: Sequence[str]) -> int:
     )
 
     print("Pass 1/2: finding peak resident groups...", file=sys.stderr)
-    top_files, top_pids, peak_stats = pass_for_peaks(
+    top_files, top_pids, top_file_pids, peak_stats = pass_for_peaks(
         conn, args, start_ts, end_ts, bucket_seconds, mapping
     )
     print(
         f"Top files={len(top_files)}, top pid_name={len(top_pids)}, "
+        f"top file+pid_name={len(top_file_pids)}, "
         f"events={peak_stats['totalEvents']}",
         file=sys.stderr,
     )
@@ -1183,6 +1298,7 @@ def main(argv: Sequence[str]) -> int:
         mapping,
         top_files,
         top_pids,
+        top_file_pids,
         candidate_pages,
     )
     write_outputs(data, args.html, args.json)
