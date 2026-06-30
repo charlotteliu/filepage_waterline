@@ -274,9 +274,104 @@ def load_candidate_pages(
     end: Optional[float],
     pid_like: Optional[str],
     file_like: Optional[str],
+    top_files: Optional[Sequence[str]] = None,
+    top_pids: Optional[Sequence[str]] = None,
+    top_file_pids: Optional[Sequence[str]] = None,
 ) -> List[PageKey]:
     if max_lanes <= 0:
         return []
+
+    candidates: List[PageKey] = []
+    seen: set = set()
+
+    def add_rows(rows: Sequence[sqlite3.Row]) -> None:
+        for r in rows:
+            key = (str(r["dev"]), str(r["ino"]), int(r["ofs"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(key)
+            if len(candidates) >= max_lanes:
+                break
+
+    def add_time_clauses(alias: str, clauses: List[str], params: List[object]) -> None:
+        if start is not None:
+            clauses.append(f"{alias}.timestamp >= ?")
+            params.append(start)
+        if end is not None:
+            clauses.append(f"{alias}.timestamp <= ?")
+            params.append(end)
+
+    per_group_limit = max(8, max_lanes // max(1, (len(top_files or []) + len(top_pids or []) + len(top_file_pids or []))))
+
+    if top_files and table_exists(conn, RESULT_TABLE):
+        for file_key in top_files:
+            if len(candidates) >= max_lanes or file_key == "__other__":
+                break
+            dev, ino = split_file_key(file_key)
+            clauses = ["r.dev = ?", "r.ino = ?"]
+            params: List[object] = [dev, ino]
+            if start is not None:
+                clauses.append("r.last_ts >= ?")
+                params.append(start)
+            if end is not None:
+                clauses.append("r.first_ts <= ?")
+                params.append(end)
+            rows = conn.execute(
+                f"SELECT r.dev, r.ino, r.ofs FROM {RESULT_TABLE} r "
+                "WHERE " + " AND ".join(clauses) + " "
+                "ORDER BY COALESCE(r.add_del_count, 0) DESC, "
+                "COALESCE(r.access_count, 0) DESC, "
+                "COALESCE(r.last_ts, 0) - COALESCE(r.first_ts, 0) DESC "
+                "LIMIT ?",
+                [*params, per_group_limit],
+            ).fetchall()
+            add_rows(rows)
+
+    if top_pids and len(candidates) < max_lanes:
+        pid_values = [pid for pid in top_pids if pid != "__other__"]
+        if pid_values:
+            placeholders = ",".join(["?"] * len(pid_values))
+            selects: List[str] = []
+            params: List[object] = []
+            for table in [ADD_TABLE, ACCESS_TABLE]:
+                clauses = [f"t.pid_name IN ({placeholders})"]
+                table_params: List[object] = list(pid_values)
+                add_time_clauses("t", clauses, table_params)
+                selects.append(f"SELECT t.dev, t.ino, t.ofs FROM {table} t WHERE " + " AND ".join(clauses))
+                params.extend(table_params)
+            rows = conn.execute(
+                "SELECT dev, ino, ofs FROM ("
+                + " UNION ALL ".join(selects)
+                + ") GROUP BY dev, ino, ofs ORDER BY COUNT(*) DESC LIMIT ?",
+                [*params, max(0, max_lanes - len(candidates))],
+            ).fetchall()
+            add_rows(rows)
+
+    if top_file_pids and len(candidates) < max_lanes:
+        for combo_key in top_file_pids:
+            if len(candidates) >= max_lanes or combo_key == "__other__":
+                break
+            file_key, pid = split_file_pid_key(combo_key)
+            dev, ino = split_file_key(file_key)
+            selects = []
+            params = []
+            for table in [ADD_TABLE, ACCESS_TABLE]:
+                clauses = ["t.dev = ?", "t.ino = ?", "t.pid_name = ?"]
+                table_params: List[object] = [dev, ino, pid]
+                add_time_clauses("t", clauses, table_params)
+                selects.append(f"SELECT t.dev, t.ino, t.ofs FROM {table} t WHERE " + " AND ".join(clauses))
+                params.extend(table_params)
+            rows = conn.execute(
+                "SELECT dev, ino, ofs FROM ("
+                + " UNION ALL ".join(selects)
+                + ") GROUP BY dev, ino, ofs ORDER BY COUNT(*) DESC LIMIT ?",
+                [*params, per_group_limit],
+            ).fetchall()
+            add_rows(rows)
+
+    if len(candidates) >= max_lanes:
+        return candidates[:max_lanes]
 
     params: List[object] = []
     if table_exists(conn, RESULT_TABLE):
@@ -302,8 +397,9 @@ def load_candidate_pages(
             "LIMIT ?"
         )
         rows = conn.execute(sql, [*params, max_lanes]).fetchall()
-        if rows:
-            return [(str(r["dev"]), str(r["ino"]), int(r["ofs"])) for r in rows]
+        add_rows(rows)
+        if len(candidates) >= max_lanes:
+            return candidates[:max_lanes]
 
     where_sql, where_params = build_table_filter(
         "t", start, end, pid_like, file_like
@@ -313,7 +409,8 @@ def load_candidate_pages(
         "ORDER BY t.timestamp LIMIT ?"
     )
     rows = conn.execute(sql, [*where_params, max_lanes]).fetchall()
-    return [(str(r["dev"]), str(r["ino"]), int(r["ofs"])) for r in rows]
+    add_rows(rows)
+    return candidates[:max_lanes]
 
 
 def load_timesteps(
@@ -541,10 +638,24 @@ def reconstruct(
                 "pidName": state["pidName"],
                 "reason": reason,
                 "accessCount": int(state.get("segmentAccessCount", 0)),
+                "firstAccess": round(float(state["segmentFirstAccess"]), 6)
+                if state.get("segmentFirstAccess") is not None
+                else None,
+                "accessDelay": round(float(state["segmentFirstAccess"]) - start, 6)
+                if state.get("segmentFirstAccess") is not None
+                else None,
+                "residentDuration": round(max(0.0, ts - start), 6),
+                "accessDelayRatio": round(
+                    max(0.0, min(1.0, (float(state["segmentFirstAccess"]) - start) / max(ts - start, 1e-9))),
+                    6,
+                )
+                if state.get("segmentFirstAccess") is not None
+                else None,
             }
         )
         state["segmentStart"] = ts
         state["segmentAccessCount"] = 0
+        state["segmentFirstAccess"] = None
 
     for ts, _sort, kind, dev, ino, ofs, pid_name in iter_events(
         conn,
@@ -578,6 +689,7 @@ def reconstruct(
                 "start": ts,
                 "segmentStart": ts,
                 "segmentAccessCount": 0,
+                "segmentFirstAccess": None,
             }
             by_file[file_key] += 1
             by_pid[pid] += 1
@@ -600,6 +712,8 @@ def reconstruct(
             if state is None:
                 anomalies["access_without_active_add"] += 1
             else:
+                if state.get("segmentFirstAccess") is None:
+                    state["segmentFirstAccess"] = ts
                 state["segmentAccessCount"] = int(state.get("segmentAccessCount", 0)) + 1
                 if pid != state["pidName"]:
                     close_lane_segment(page_key, ts, "pid_change")
@@ -739,13 +853,48 @@ button.active {
   background: var(--ink);
   color: white;
 }
-input[type="search"] {
+input[type="search"], input[type="number"] {
   width: min(420px, 100%);
   border: 1px solid var(--line);
   background: white;
   border-radius: 7px;
   padding: 9px 11px;
   font-size: 13px;
+}
+input[type="number"] {
+  width: 86px;
+}
+.detail-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  align-items: center;
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.detail-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.selection-pill {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(760px, 100%);
+  color: var(--ink);
+}
+.selection-pill button {
+  min-width: 30px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  background: #fffaf0;
+}
+.life-scroll {
+  max-height: 720px;
+  overflow: auto;
 }
 main { padding: 18px 24px 28px; }
 .stats {
@@ -844,12 +993,20 @@ canvas {
     <canvas id="summaryCanvas"></canvas>
   </section>
   <div class="legend" id="legend"></div>
+  <section class="detail-controls">
+    <div class="selection-pill" id="selectionPill"></div>
+    <label>ratio ≥ <input id="ratioMin" type="number" min="0" max="100" step="1" value="0"></label>
+    <label>ratio ≤ <input id="ratioMax" type="number" min="0" max="100" step="1" value="100"></label>
+    <label>rows <input id="laneLimit" type="number" min="20" max="5000" step="20" value="240"></label>
+  </section>
   <section class="canvas-wrap">
     <div class="canvas-title">
       <strong>抽样文件页驻留生命周期</strong>
-      <small>横轴为 timestamp；条带表示 resident，短线表示 add/access/delete</small>
+      <small id="lifeLabel">横轴为 timestamp；条带表示 resident，短线表示 add/access/delete</small>
     </div>
-    <canvas id="lifeCanvas"></canvas>
+    <div class="life-scroll">
+      <canvas id="lifeCanvas"></canvas>
+    </div>
   </section>
 </main>
 <div class="tip" id="tip"></div>
@@ -858,6 +1015,10 @@ canvas {
 const data = JSON.parse(document.getElementById('fscache-data').textContent);
 let mode = 'file';
 let filter = '';
+let selectedSummary = null;
+let laneLimit = 240;
+let ratioMin = 0;
+let ratioMax = 1;
 const palette = [
   '#0f766e','#b42318','#1d4ed8','#ca8a04','#7c3aed','#15803d','#be185d',
   '#0e7490','#9a3412','#4338ca','#4d7c0f','#a21caf','#0369a1','#c2410c',
@@ -909,6 +1070,147 @@ function labelForKey(key) {
   const found = groupList().find(g => g.key === key);
   return found ? found.label : key;
 }
+function shortStepLabel(step) {
+  const text = String(step?.step || '');
+  return text.length > 18 ? text.slice(0, 17) + '...' : text;
+}
+function nearestStep(t) {
+  const steps = data.timesteps || [];
+  if (!steps.length) return null;
+  let best = steps[0];
+  let delta = Math.abs(best.timestamp - t);
+  for (const step of steps) {
+    const next = Math.abs(step.timestamp - t);
+    if (next < delta) {
+      best = step;
+      delta = next;
+    }
+  }
+  return best;
+}
+function drawTimestepAxis(ctx, pad, w, plotBottom, start, end) {
+  const steps = data.timesteps || [];
+  if (!steps.length) return;
+  const span = Math.max(end - start, .001);
+  const iw = w - pad.l - pad.r;
+  ctx.save();
+  ctx.font = '11px "Avenir Next", sans-serif';
+  ctx.textBaseline = 'top';
+  ctx.lineWidth = 1;
+  let lastLabelX = -Infinity;
+  for (const step of steps) {
+    const x = pad.l + ((step.timestamp - start) / span) * iw;
+    if (x < pad.l || x > w - pad.r) continue;
+    ctx.strokeStyle = '#7b8790';
+    ctx.globalAlpha = .22;
+    ctx.beginPath();
+    ctx.moveTo(x, pad.t);
+    ctx.lineTo(x, plotBottom);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    if (x - lastLabelX >= 96) {
+      ctx.fillStyle = '#3d4744';
+      ctx.fillText(shortStepLabel(step), Math.min(x + 4, w - pad.r - 120), 8);
+      ctx.strokeStyle = '#16211f';
+      ctx.globalAlpha = .38;
+      ctx.beginPath();
+      ctx.moveTo(x, pad.t - 7);
+      ctx.lineTo(x, pad.t);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      lastLabelX = x;
+    }
+  }
+  ctx.strokeStyle = '#9ca6a2';
+  ctx.globalAlpha = .5;
+  ctx.beginPath();
+  ctx.moveTo(pad.l, pad.t - 1);
+  ctx.lineTo(w - pad.r, pad.t - 1);
+  ctx.stroke();
+  ctx.restore();
+}
+function actualGroupKeys(groupMode) {
+  const groups = groupMode === 'file'
+    ? data.groups.files
+    : (groupMode === 'pid' ? data.groups.pids : (data.groups.filePids || []));
+  return groups.filter(g => g.key !== '__other__').map(g => g.key);
+}
+function laneMatchesSummary(lane) {
+  if (!selectedSummary || !selectedSummary.key) return true;
+  const key = selectedSummary.key;
+  if (selectedSummary.mode === 'file') {
+    if (key === '__other__') return !actualGroupKeys('file').includes(lane.fileKey);
+    return lane.fileKey === key;
+  }
+  if (selectedSummary.mode === 'pid') {
+    const pids = (lane.segments || []).map(s => s.pidName);
+    if (key === '__other__') return pids.some(pid => !actualGroupKeys('pid').includes(pid));
+    return pids.includes(key);
+  }
+  const combos = (lane.segments || []).map(s => filePidKey(s.fileKey, s.pidName));
+  if (key === '__other__') return combos.some(combo => !actualGroupKeys('filePid').includes(combo));
+  return combos.includes(key);
+}
+function laneMatchesRatio(lane) {
+  const constrained = ratioMin > 0 || ratioMax < 1;
+  let hasAccessSegment = false;
+  for (const seg of lane.segments || []) {
+    if (seg.accessDelayRatio == null) continue;
+    hasAccessSegment = true;
+    if (seg.accessDelayRatio >= ratioMin && seg.accessDelayRatio <= ratioMax) return true;
+  }
+  return constrained ? false : true;
+}
+function renderSelection() {
+  const el = document.getElementById('selectionPill');
+  if (!selectedSummary) {
+    el.innerHTML = '<span class="muted">未选中上图分组</span>';
+    return;
+  }
+  el.innerHTML = `<span><b>${escapeHtml(selectedSummary.modeLabel)}</b> ${escapeHtml(selectedSummary.label)}</span>` +
+    `<button id="clearSelection" type="button">×</button>`;
+  document.getElementById('clearSelection').onclick = () => {
+    selectedSummary = null;
+    renderSelection();
+    drawLife();
+  };
+}
+function summaryHitFromEvent(e) {
+  const chart = window.__summaryChart;
+  if (!chart || !data.series?.length) return null;
+  const rect = e.currentTarget.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  const {pad, iw, ih, start, end, maxY} = chart;
+  if (x < pad.l || x > rect.width - pad.r || y < pad.t || y > rect.height - pad.b) return null;
+  const t = start + ((x - pad.l) / Math.max(iw, 1)) * Math.max(end - start, .001);
+  let index = 0;
+  let best = Infinity;
+  for (let i = 0; i < data.series.length; i++) {
+    const delta = Math.abs(data.series[i].t - t);
+    if (delta < best) { best = delta; index = i; }
+  }
+  const s = data.series[index];
+  const targetValue = maxY * (1 - (y - pad.t) / Math.max(ih, 1));
+  let base = 0;
+  for (const g of groupList()) {
+    const count = seriesBucket(s)[g.key] || 0;
+    if (count > 0 && targetValue >= base && targetValue <= base + count) {
+      return {
+        key: g.key,
+        label: labelForKey(g.key),
+        count,
+        total: s.total,
+        t: s.t,
+        step: nearestStep(s.t),
+        index,
+        mode,
+        modeLabel: modeLabel(),
+      };
+    }
+    base += count;
+  }
+  return {key: null, label: 'total resident pages', count: s.total, total: s.total, t: s.t, step: nearestStep(s.t), index, mode, modeLabel: modeLabel()};
+}
 function installStats() {
   const m = data.metadata;
   const span = Math.max(0, m.end - m.start);
@@ -927,7 +1229,7 @@ function installStats() {
 function drawSummary() {
   const canvas = document.getElementById('summaryCanvas');
   const {ctx, w, h} = resizeCanvas(canvas);
-  const pad = {l: 54, r: 16, t: 16, b: 30};
+  const pad = {l: 54, r: 16, t: 42, b: 30};
   const iw = w - pad.l - pad.r;
   const ih = h - pad.t - pad.b;
   const start = data.metadata.start;
@@ -946,14 +1248,7 @@ function drawSummary() {
     const value = maxY * (1 - i / 4);
     ctx.fillText(fmt(value), 8, y + 4);
   }
-  for (const step of data.timesteps || []) {
-    const x = pad.l + ((step.timestamp - start) / Math.max(end - start, .001)) * iw;
-    if (x < pad.l || x > w - pad.r) continue;
-    ctx.strokeStyle = '#7b8790';
-    ctx.globalAlpha = .28;
-    ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, h - pad.b); ctx.stroke();
-    ctx.globalAlpha = 1;
-  }
+  drawTimestepAxis(ctx, pad, w, h - pad.b, start, end);
   const groups = groupList().map(g => g.key);
   const bases = new Array(data.series.length).fill(0);
   window.__summaryChart = { pad, w, h, iw, ih, start, end, maxY };
@@ -991,8 +1286,9 @@ function drawSummary() {
 }
 function filteredLanes() {
   const q = filter.trim().toLowerCase();
-  if (!q) return data.lanes || [];
   return (data.lanes || []).filter(l => {
+    if (!laneMatchesSummary(l) || !laneMatchesRatio(l)) return false;
+    if (!q) return true;
     const hay = [
       l.id, l.fileLabel, l.fileKey,
       ...(l.segments || []).map(s => s.pidName)
@@ -1002,13 +1298,15 @@ function filteredLanes() {
 }
 function drawLife() {
   const canvas = document.getElementById('lifeCanvas');
-  const {ctx, w, h} = resizeCanvas(canvas);
-  const lanes = filteredLanes();
+  const allLanes = filteredLanes();
+  const lanes = allLanes.slice(0, laneLimit);
   const start = data.metadata.start;
   const end = data.metadata.end;
-  const pad = {l: 210, r: 18, t: 16, b: 30};
-  const rowH = Math.max(10, Math.min(24, (h - pad.t - pad.b) / Math.max(lanes.length, 1)));
-  const visible = Math.min(lanes.length, Math.floor((h - pad.t - pad.b) / rowH));
+  const pad = {l: 210, r: 18, t: 42, b: 30};
+  const rowH = 18;
+  canvas.style.height = Math.max(300, pad.t + lanes.length * rowH + pad.b) + 'px';
+  const {ctx, w, h} = resizeCanvas(canvas);
+  const visible = lanes.length;
   const iw = w - pad.l - pad.r;
   window.__hitSegments = [];
   ctx.clearRect(0, 0, w, h);
@@ -1016,14 +1314,7 @@ function drawLife() {
   ctx.fillRect(0, 0, w, h);
   ctx.font = '11px "Avenir Next", sans-serif';
   ctx.textBaseline = 'middle';
-  for (const step of data.timesteps || []) {
-    const x = pad.l + ((step.timestamp - start) / Math.max(end - start, .001)) * iw;
-    if (x < pad.l || x > w - pad.r) continue;
-    ctx.strokeStyle = '#7b8790';
-    ctx.globalAlpha = .22;
-    ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, h - pad.b); ctx.stroke();
-    ctx.globalAlpha = 1;
-  }
+  drawTimestepAxis(ctx, pad, w, h - pad.b, start, end);
   for (let i = 0; i < visible; i++) {
     const lane = lanes[i];
     const y = pad.t + i * rowH;
@@ -1042,6 +1333,24 @@ function drawLife() {
       ctx.globalAlpha = .86;
       ctx.fillRect(Math.max(pad.l, x1), y + 2, Math.max(1, x2 - x1), Math.max(4, rowH - 4));
       ctx.globalAlpha = 1;
+      if (seg.firstAccess != null) {
+        const xa = pad.l + ((seg.firstAccess - start) / Math.max(end - start, .001)) * iw;
+        ctx.fillStyle = 'rgba(255, 255, 255, .58)';
+        ctx.fillRect(Math.max(pad.l, x1), y + 4, Math.max(1, xa - x1), Math.max(2, rowH - 8));
+        ctx.strokeStyle = '#111827';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(xa, y + 1);
+        ctx.lineTo(xa, y + rowH - 1);
+        ctx.stroke();
+        ctx.fillStyle = '#111827';
+        ctx.beginPath();
+        ctx.moveTo(xa, y + 1);
+        ctx.lineTo(xa - 4, y + 7);
+        ctx.lineTo(xa + 4, y + 7);
+        ctx.closePath();
+        ctx.fill();
+      }
       window.__hitSegments.push({x1, x2, y1: y, y2: y + rowH, lane, seg});
     }
     for (const ev of lane.events || []) {
@@ -1068,6 +1377,8 @@ function drawLife() {
     ctx.font = '14px "Avenir Next", sans-serif';
     ctx.fillText('没有匹配的生命周期条带', 18, 48);
   }
+  document.getElementById('lifeLabel').textContent =
+    `显示 ${fmt(lanes.length)} / ${fmt(allLanes.length)} 条；横轴为 timestamp；亮色段为 add→first access`;
 }
 function drawLegend() {
   const groups = groupList().slice(0, 28);
@@ -1093,48 +1404,39 @@ document.getElementById('modeFilePid').onclick = () => {
   setMode('filePid');
 };
 document.getElementById('search').oninput = (e) => { filter = e.target.value; drawLife(); };
+document.getElementById('laneLimit').oninput = (e) => {
+  laneLimit = Math.max(20, Math.min(5000, Number(e.target.value) || 240));
+  drawLife();
+};
+document.getElementById('ratioMin').oninput = (e) => {
+  ratioMin = Math.max(0, Math.min(1, (Number(e.target.value) || 0) / 100));
+  drawLife();
+};
+document.getElementById('ratioMax').oninput = (e) => {
+  ratioMax = Math.max(0, Math.min(1, (Number(e.target.value) || 100) / 100));
+  drawLife();
+};
 document.getElementById('summaryCanvas').addEventListener('mousemove', (e) => {
   const tip = document.getElementById('tip');
-  const chart = window.__summaryChart;
-  if (!chart || !data.series?.length) { tip.style.display = 'none'; return; }
-  const rect = e.currentTarget.getBoundingClientRect();
-  const x = e.clientX - rect.left, y = e.clientY - rect.top;
-  const {pad, iw, ih, start, end, maxY} = chart;
-  if (x < pad.l || x > rect.width - pad.r || y < pad.t || y > rect.height - pad.b) {
-    tip.style.display = 'none';
-    return;
-  }
-  const t = start + ((x - pad.l) / Math.max(iw, 1)) * Math.max(end - start, .001);
-  let index = 0;
-  let best = Infinity;
-  for (let i = 0; i < data.series.length; i++) {
-    const delta = Math.abs(data.series[i].t - t);
-    if (delta < best) { best = delta; index = i; }
-  }
-  const s = data.series[index];
-  const targetValue = maxY * (1 - (y - pad.t) / Math.max(ih, 1));
-  let base = 0;
-  let hitKey = null;
-  let hitCount = 0;
-  for (const g of groupList()) {
-    const count = seriesBucket(s)[g.key] || 0;
-    if (count > 0 && targetValue >= base && targetValue <= base + count) {
-      hitKey = g.key;
-      hitCount = count;
-      break;
-    }
-    base += count;
-  }
-  const label = hitKey ? labelForKey(hitKey) : 'total resident pages';
-  const pct = s.total ? (hitCount * 100 / s.total).toFixed(1) : '0.0';
-  tip.innerHTML = `<b>${escapeHtml(modeLabel())}</b><br>` +
-    `<span class="muted">${timeFmt(s.t)} · bucket ${index + 1}/${data.series.length}</span><br>` +
-    `${escapeHtml(label)}<br>` +
-    `pages: <b>${fmt(hitKey ? hitCount : s.total)}</b>` +
-    (hitKey ? ` · total: ${fmt(s.total)} · ${pct}%` : '');
+  const hit = summaryHitFromEvent(e);
+  if (!hit) { tip.style.display = 'none'; return; }
+  const pct = hit.total ? (hit.count * 100 / hit.total).toFixed(1) : '0.0';
+  tip.innerHTML = `<b>${escapeHtml(hit.modeLabel)}</b><br>` +
+    `<span class="muted">${timeFmt(hit.t)} · bucket ${hit.index + 1}/${data.series.length}</span><br>` +
+    (hit.step ? `<span class="muted">业务步骤: ${escapeHtml(hit.step.step)}</span><br>` : '') +
+    `${escapeHtml(hit.label)}<br>` +
+    `pages: <b>${fmt(hit.count)}</b>` +
+    (hit.key ? ` · total: ${fmt(hit.total)} · ${pct}%` : '');
   tip.style.left = Math.min(window.innerWidth - 540, e.clientX + 14) + 'px';
   tip.style.top = Math.min(window.innerHeight - 120, e.clientY + 14) + 'px';
   tip.style.display = 'block';
+});
+document.getElementById('summaryCanvas').addEventListener('click', (e) => {
+  const hit = summaryHitFromEvent(e);
+  if (!hit || !hit.key) return;
+  selectedSummary = hit;
+  renderSelection();
+  drawLife();
 });
 document.getElementById('summaryCanvas').addEventListener('mouseleave', () => {
   document.getElementById('tip').style.display = 'none';
@@ -1145,10 +1447,15 @@ document.getElementById('lifeCanvas').addEventListener('mousemove', (e) => {
   const x = e.clientX - rect.left, y = e.clientY - rect.top;
   const hit = (window.__hitSegments || []).find(s => x >= s.x1 && x <= s.x2 && y >= s.y1 && y <= s.y2);
   if (!hit) { tip.style.display = 'none'; return; }
+  const segStep = nearestStep(hit.seg.start);
   tip.innerHTML = `<b>${escapeHtml(hit.lane.fileLabel)}</b><br>` +
     `<span class="muted">${escapeHtml(hit.lane.id)}</span><br>` +
+    (segStep ? `<span class="muted">业务步骤: ${escapeHtml(segStep.step)}</span><br>` : '') +
     `pid_name: ${escapeHtml(hit.seg.pidName)}<br>` +
-    `${timeFmt(hit.seg.start)} - ${timeFmt(hit.seg.end)} · access ${fmt(hit.seg.accessCount)}`;
+    `${timeFmt(hit.seg.start)} - ${timeFmt(hit.seg.end)} · access ${fmt(hit.seg.accessCount)}<br>` +
+    (hit.seg.firstAccess == null
+      ? '<span class="muted">no access in this resident interval</span>'
+      : `first access: ${timeFmt(hit.seg.firstAccess)} · delay ${timeFmt(hit.seg.accessDelay)} / resident ${timeFmt(hit.seg.residentDuration)} · ratio ${(hit.seg.accessDelayRatio * 100).toFixed(1)}%`);
   tip.style.left = Math.min(window.innerWidth - 540, e.clientX + 14) + 'px';
   tip.style.top = Math.min(window.innerHeight - 120, e.clientY + 14) + 'px';
   tip.style.display = 'block';
@@ -1158,6 +1465,7 @@ document.getElementById('lifeCanvas').addEventListener('mouseleave', () => {
 });
 window.addEventListener('resize', redraw);
 installStats();
+renderSelection();
 redraw();
 </script>
 </body>
@@ -1272,11 +1580,6 @@ def main(argv: Sequence[str]) -> int:
         file=sys.stderr,
     )
 
-    print("Selecting lifecycle lanes...", file=sys.stderr)
-    candidate_pages = load_candidate_pages(
-        conn, args.max_lanes, args.start, args.end, args.pid_like, args.file_like
-    )
-
     print("Pass 1/2: finding peak resident groups...", file=sys.stderr)
     top_files, top_pids, top_file_pids, peak_stats = pass_for_peaks(
         conn, args, start_ts, end_ts, bucket_seconds, mapping
@@ -1286,6 +1589,19 @@ def main(argv: Sequence[str]) -> int:
         f"top file+pid_name={len(top_file_pids)}, "
         f"events={peak_stats['totalEvents']}",
         file=sys.stderr,
+    )
+
+    print("Selecting lifecycle lanes...", file=sys.stderr)
+    candidate_pages = load_candidate_pages(
+        conn,
+        args.max_lanes,
+        args.start,
+        args.end,
+        args.pid_like,
+        args.file_like,
+        top_files,
+        top_pids,
+        top_file_pids,
     )
 
     print("Pass 2/2: reconstructing series and page lifecycles...", file=sys.stderr)
