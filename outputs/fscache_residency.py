@@ -452,7 +452,7 @@ def pass_for_peaks(
     end_ts: float,
     bucket_seconds: float,
     mapping: Dict[FileKey, Dict[str, object]],
-) -> Tuple[List[str], List[str], List[str], Dict[str, object]]:
+) -> Tuple[List[str], List[str], List[str], List[str], Dict[str, object]]:
     active: Dict[PageKey, Tuple[str, str]] = {}
     by_file: collections.Counter = collections.Counter()
     by_pid: collections.Counter = collections.Counter()
@@ -460,6 +460,7 @@ def pass_for_peaks(
     peak_file: collections.Counter = collections.Counter()
     peak_pid: collections.Counter = collections.Counter()
     peak_file_pid: collections.Counter = collections.Counter()
+    first_file_add: Dict[str, float] = {}
     anomalies = collections.Counter()
     total_events = 0
     next_bucket = start_ts
@@ -503,6 +504,7 @@ def pass_for_peaks(
             by_file[file_key] += 1
             by_pid[pid] += 1
             by_file_pid[make_file_pid_key(file_key, pid)] += 1
+            first_file_add.setdefault(file_key, ts)
         elif kind == "delete":
             old = active.pop(page_key, None)
             if old is None:
@@ -532,13 +534,15 @@ def pass_for_peaks(
     top_files = [k for k, _v in peak_file.most_common(args.max_groups)]
     top_pids = [k for k, _v in peak_pid.most_common(args.max_groups)]
     top_file_pids = [k for k, _v in peak_file_pid.most_common(args.max_groups)]
+    heatmap_files = [k for k, _v in peak_file.most_common(args.max_heatmap_files)]
+    heatmap_files.sort(key=lambda k: (first_file_add.get(k, float("inf")), k))
     stats = {
         "totalEvents": total_events,
         "openPagesAtEnd": len(active),
         "anomalies": dict(anomalies),
         "peakResidentPages": int(sum(max(v, 0) for v in by_file.values())),
     }
-    return top_files, top_pids, top_file_pids, stats
+    return top_files, top_pids, top_file_pids, heatmap_files, stats
 
 
 def reconstruct(
@@ -551,6 +555,7 @@ def reconstruct(
     top_files: Sequence[str],
     top_pids: Sequence[str],
     top_file_pids: Sequence[str],
+    heatmap_files: Sequence[str],
     candidate_pages: Sequence[PageKey],
 ) -> Dict[str, object]:
     active: Dict[PageKey, Dict[str, object]] = {}
@@ -564,6 +569,10 @@ def reconstruct(
     top_file_set = set(top_files)
     top_pid_set = set(top_pids)
     top_file_pid_set = set(top_file_pids)
+    heatmap_file_set = set(heatmap_files)
+    heatmap_times: List[float] = []
+    heatmap_values_by_file: Dict[str, List[int]] = {k: [] for k in heatmap_files}
+    heatmap_peak_by_file: Dict[str, int] = {k: 0 for k in heatmap_files}
     next_bucket = start_ts
     total_events = 0
 
@@ -591,6 +600,12 @@ def reconstruct(
                 "byFilePid": by_file_pid_payload,
             }
         )
+        heatmap_times.append(round(ts, 6))
+        for key in heatmap_files:
+            value = int(max(0, by_file[key]))
+            heatmap_values_by_file[key].append(value)
+            if value > heatmap_peak_by_file[key]:
+                heatmap_peak_by_file[key] = value
 
     def ensure_lane(page_key: PageKey) -> Optional[Dict[str, object]]:
         if page_key not in lane_order:
@@ -734,7 +749,7 @@ def reconstruct(
 
     file_meta = {}
     file_keys_from_file_pid = {split_file_pid_key(key)[0] for key in top_file_pids if key != "__other__"}
-    for key in set(top_files) | file_keys_from_file_pid | {lane["fileKey"] for lane in lanes.values()}:
+    for key in set(top_files) | set(heatmap_files) | file_keys_from_file_pid | {lane["fileKey"] for lane in lanes.values()}:
         if key == "__other__":
             continue
         dev, ino = split_file_key(key)
@@ -756,6 +771,17 @@ def reconstruct(
     ordered_lanes = [
         lanes[key]
         for key in sorted(lanes.keys(), key=lambda item: lane_order.get(item, 10**12))
+    ]
+    heatmap_max = max([0, *heatmap_peak_by_file.values()])
+    heatmap_rows = [
+        {
+            "key": key,
+            "label": file_meta.get(key, {}).get("filename", key),
+            "dev": file_meta.get(key, {}).get("dev", split_file_key(key)[0]),
+            "ino": file_meta.get(key, {}).get("ino", split_file_key(key)[1]),
+            "peak": int(heatmap_peak_by_file.get(key, 0)),
+        }
+        for key in heatmap_files
     ]
     return {
         "metadata": {
@@ -780,6 +806,12 @@ def reconstruct(
         },
         "fileMeta": file_meta,
         "series": series,
+        "heatmap": {
+            "times": heatmap_times,
+            "files": heatmap_rows,
+            "values": [heatmap_values_by_file[key] for key in heatmap_files],
+            "max": int(heatmap_max),
+        },
         "lanes": ordered_lanes,
         "timesteps": load_timesteps(conn, start_ts, end_ts),
     }
@@ -892,7 +924,7 @@ input[type="number"] {
   border: 1px solid var(--line);
   background: #fffaf0;
 }
-.life-scroll {
+.scroll-canvas {
   max-height: 720px;
   overflow: auto;
 }
@@ -934,6 +966,7 @@ canvas {
   width: 100%;
 }
 #summaryCanvas { height: 260px; }
+#heatmapCanvas { height: 520px; }
 #lifeCanvas { height: 620px; }
 .legend {
   display: flex;
@@ -968,6 +1001,7 @@ canvas {
   header, main { padding-left: 14px; padding-right: 14px; }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   #lifeCanvas { height: 520px; }
+  #heatmapCanvas { height: 460px; }
 }
 </style>
 </head>
@@ -993,6 +1027,15 @@ canvas {
     <canvas id="summaryCanvas"></canvas>
   </section>
   <div class="legend" id="legend"></div>
+  <section class="canvas-wrap">
+    <div class="canvas-title">
+      <strong>文件 / inode 驻留热力图</strong>
+      <small id="heatmapLabel">颜色越深表示该文件 resident pages 越多</small>
+    </div>
+    <div class="scroll-canvas">
+      <canvas id="heatmapCanvas"></canvas>
+    </div>
+  </section>
   <section class="detail-controls">
     <div class="selection-pill" id="selectionPill"></div>
     <label>ratio ≥ <input id="ratioMin" type="number" min="0" max="100" step="1" value="0"></label>
@@ -1004,7 +1047,7 @@ canvas {
       <strong>抽样文件页驻留生命周期</strong>
       <small id="lifeLabel">横轴为 timestamp；条带表示 resident，短线表示 add/access/delete</small>
     </div>
-    <div class="life-scroll">
+    <div class="scroll-canvas">
       <canvas id="lifeCanvas"></canvas>
     </div>
   </section>
@@ -1380,13 +1423,73 @@ function drawLife() {
   document.getElementById('lifeLabel').textContent =
     `显示 ${fmt(lanes.length)} / ${fmt(allLanes.length)} 条；横轴为 timestamp；亮色段为 add→first access`;
 }
+function heatColor(value, maxValue) {
+  if (!value || !maxValue) return 'rgba(240, 244, 241, .88)';
+  const intensity = Math.max(0, Math.min(1, value / maxValue));
+  const alpha = 0.16 + intensity * 0.82;
+  return `rgba(15, 118, 110, ${alpha})`;
+}
+function drawHeatmap() {
+  const canvas = document.getElementById('heatmapCanvas');
+  const heatmap = data.heatmap || {files: [], times: [], values: [], max: 0};
+  const rowH = 16;
+  const pad = {l: 260, r: 18, t: 42, b: 30};
+  canvas.style.height = Math.max(320, pad.t + heatmap.files.length * rowH + pad.b) + 'px';
+  const {ctx, w, h} = resizeCanvas(canvas);
+  const start = data.metadata.start;
+  const end = data.metadata.end;
+  const iw = w - pad.l - pad.r;
+  const plotBottom = h - pad.b;
+  const cellW = Math.max(1, iw / Math.max(heatmap.times.length, 1));
+  window.__heatmapChart = {pad, w, h, rowH, start, end, cellW};
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, w, h);
+  drawTimestepAxis(ctx, pad, w, plotBottom, start, end);
+  ctx.font = '11px "Avenir Next", sans-serif';
+  ctx.textBaseline = 'middle';
+
+  for (let r = 0; r < heatmap.files.length; r++) {
+    const file = heatmap.files[r];
+    const y = pad.t + r * rowH;
+    if (r % 2 === 0) {
+      ctx.fillStyle = '#fbfaf6';
+      ctx.fillRect(0, y, w, rowH);
+    }
+    ctx.fillStyle = '#3d4744';
+    const label = `${file.label}`;
+    ctx.fillText(label.length > 42 ? label.slice(0, 39) + '...' : label, 10, y + rowH / 2);
+    const row = heatmap.values[r] || [];
+    for (let c = 0; c < row.length; c++) {
+      const value = row[c] || 0;
+      const x = pad.l + c * cellW;
+      ctx.fillStyle = heatColor(value, heatmap.max);
+      ctx.fillRect(x, y + 1, Math.max(1, cellW + .4), Math.max(1, rowH - 2));
+    }
+  }
+  ctx.strokeStyle = '#16211f';
+  ctx.beginPath();
+  ctx.moveTo(pad.l, pad.t);
+  ctx.lineTo(pad.l, plotBottom);
+  ctx.lineTo(w - pad.r, plotBottom);
+  ctx.stroke();
+  ctx.fillStyle = '#66706d';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(timeFmt(start), pad.l, h - 9);
+  ctx.textAlign = 'right';
+  ctx.fillText(timeFmt(end), w - pad.r, h - 9);
+  ctx.textAlign = 'left';
+  document.getElementById('heatmapLabel').textContent =
+    `显示 ${fmt(heatmap.files.length)} 个文件/inode；Y 轴按首次 add 时间排序；峰值 ${fmt(heatmap.max)} pages`;
+}
 function drawLegend() {
   const groups = groupList().slice(0, 28);
   document.getElementById('legend').innerHTML = groups.map(g =>
     `<span title="${escapeHtml(g.label)}"><i class="swatch" style="background:${keyColor(g.key)}"></i>${escapeHtml(g.label)}</span>`
   ).join('');
 }
-function redraw() { drawSummary(); drawLegend(); drawLife(); }
+function redraw() { drawSummary(); drawLegend(); drawHeatmap(); drawLife(); }
 function setMode(nextMode) {
   mode = nextMode;
   document.getElementById('modeFile').classList.toggle('active', mode === 'file');
@@ -1463,6 +1566,36 @@ document.getElementById('lifeCanvas').addEventListener('mousemove', (e) => {
 document.getElementById('lifeCanvas').addEventListener('mouseleave', () => {
   document.getElementById('tip').style.display = 'none';
 });
+document.getElementById('heatmapCanvas').addEventListener('mousemove', (e) => {
+  const tip = document.getElementById('tip');
+  const heatmap = data.heatmap || {files: [], times: [], values: [], max: 0};
+  const chart = window.__heatmapChart;
+  if (!chart || !heatmap.files.length || !heatmap.times.length) { tip.style.display = 'none'; return; }
+  const rect = e.currentTarget.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  const {pad, rowH, cellW} = chart;
+  if (x < pad.l || x > rect.width - pad.r || y < pad.t || y > rect.height - pad.b) {
+    tip.style.display = 'none';
+    return;
+  }
+  const rowIndex = Math.floor((y - pad.t) / rowH);
+  const colIndex = Math.max(0, Math.min(heatmap.times.length - 1, Math.floor((x - pad.l) / Math.max(cellW, 1))));
+  const file = heatmap.files[rowIndex];
+  if (!file) { tip.style.display = 'none'; return; }
+  const value = (heatmap.values[rowIndex] || [])[colIndex] || 0;
+  const t = heatmap.times[colIndex];
+  const step = nearestStep(t);
+  tip.innerHTML = `<b>${escapeHtml(file.label)}</b><br>` +
+    `<span class="muted">${escapeHtml(file.dev)} · ${escapeHtml(file.ino)}</span><br>` +
+    `<span class="muted">${timeFmt(t)}${step ? ' · 业务步骤: ' + escapeHtml(step.step) : ''}</span><br>` +
+    `resident pages: <b>${fmt(value)}</b> · file peak: ${fmt(file.peak)}`;
+  tip.style.left = Math.min(window.innerWidth - 540, e.clientX + 14) + 'px';
+  tip.style.top = Math.min(window.innerHeight - 120, e.clientY + 14) + 'px';
+  tip.style.display = 'block';
+});
+document.getElementById('heatmapCanvas').addEventListener('mouseleave', () => {
+  document.getElementById('tip').style.display = 'none';
+});
 window.addEventListener('resize', redraw);
 installStats();
 renderSelection();
@@ -1524,6 +1657,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Number of page lifecycles to retain for the lower chart.",
     )
     parser.add_argument(
+        "--max-heatmap-files",
+        type=int,
+        default=260,
+        help="Number of files/inodes to retain for the residency heatmap.",
+    )
+    parser.add_argument(
         "--max-lane-events",
         type=int,
         default=2000,
@@ -1581,12 +1720,12 @@ def main(argv: Sequence[str]) -> int:
     )
 
     print("Pass 1/2: finding peak resident groups...", file=sys.stderr)
-    top_files, top_pids, top_file_pids, peak_stats = pass_for_peaks(
+    top_files, top_pids, top_file_pids, heatmap_files, peak_stats = pass_for_peaks(
         conn, args, start_ts, end_ts, bucket_seconds, mapping
     )
     print(
         f"Top files={len(top_files)}, top pid_name={len(top_pids)}, "
-        f"top file+pid_name={len(top_file_pids)}, "
+        f"top file+pid_name={len(top_file_pids)}, heatmap files={len(heatmap_files)}, "
         f"events={peak_stats['totalEvents']}",
         file=sys.stderr,
     )
@@ -1615,6 +1754,7 @@ def main(argv: Sequence[str]) -> int:
         top_files,
         top_pids,
         top_file_pids,
+        heatmap_files,
         candidate_pages,
     )
     write_outputs(data, args.html, args.json)

@@ -66,13 +66,48 @@ button.active {
   background: var(--ink);
   color: white;
 }
-input[type="search"] {
+input[type="search"], input[type="number"] {
   width: min(420px, 100%);
   border: 1px solid var(--line);
   background: white;
   border-radius: 7px;
   padding: 9px 11px;
   font-size: 13px;
+}
+input[type="number"] {
+  width: 86px;
+}
+.detail-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  align-items: center;
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.detail-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.selection-pill {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(760px, 100%);
+  color: var(--ink);
+}
+.selection-pill button {
+  min-width: 30px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  background: #fffaf0;
+}
+.life-scroll {
+  max-height: 720px;
+  overflow: auto;
 }
 main { padding: 18px 24px 28px; }
 .stats {
@@ -171,20 +206,32 @@ canvas {
     <canvas id="summaryCanvas"></canvas>
   </section>
   <div class="legend" id="legend"></div>
+  <section class="detail-controls">
+    <div class="selection-pill" id="selectionPill"></div>
+    <label>ratio ≥ <input id="ratioMin" type="number" min="0" max="100" step="1" value="0"></label>
+    <label>ratio ≤ <input id="ratioMax" type="number" min="0" max="100" step="1" value="100"></label>
+    <label>rows <input id="laneLimit" type="number" min="20" max="5000" step="20" value="240"></label>
+  </section>
   <section class="canvas-wrap">
     <div class="canvas-title">
       <strong>抽样文件页驻留生命周期</strong>
-      <small>横轴为 timestamp；条带表示 resident，短线表示 add/access/delete</small>
+      <small id="lifeLabel">横轴为 timestamp；条带表示 resident，短线表示 add/access/delete</small>
     </div>
-    <canvas id="lifeCanvas"></canvas>
+    <div class="life-scroll">
+      <canvas id="lifeCanvas"></canvas>
+    </div>
   </section>
 </main>
 <div class="tip" id="tip"></div>
-<script id="fscache-data" type="application/json">{"metadata": {"dbPath": "/Users/gavinliu/Documents/Codex/2026-06-30/db-users-gavinliu-downloads-fscachedb-md/work/sample_fscache.db", "start": 80.5, "end": 108.0, "bucketSeconds": 2.0, "pageSize": 4096, "includeAccess": true, "eventLimit": null, "totalEvents": 13, "openPagesAtEnd": 1, "anomalies": {}}, "groups": {"files": [{"key": "260:69|0x1", "label": "/data/app/music.db"}, {"key": "260:69|0x2", "label": "/data/app/chat.log"}, {"key": "0:5|0x3", "label": "/tmp/short.txt"}], "pids": [{"key": "loader", "label": "loader"}, {"key": "music", "label": "music"}, {"key": "chat", "label": "chat"}, {"key": "scanner", "label": "scanner"}, {"key": "tmpd", "label": "tmpd"}, {"key": "syncer", "label": "syncer"}], "filePids": [{"key": "260:69|0x1\u001floader", "label": "/data/app/music.db · loader"}, {"key": "260:69|0x1\u001fmusic", "label": "/data/app/music.db · music"}, {"key": "260:69|0x2\u001fchat", "label": "/data/app/chat.log · chat"}, {"key": "260:69|0x1\u001fscanner", "label": "/data/app/music.db · scanner"}, {"key": "0:5|0x3\u001ftmpd", "label": "/tmp/short.txt · tmpd"}, {"key": "260:69|0x2\u001fsyncer", "label": "/data/app/chat.log · syncer"}]}, "fileMeta": {"260:69|0x2": {"dev": "260:69", "ino": "0x2", "filename": "/data/app/chat.log", "size": 12288}, "260:69|0x1": {"dev": "260:69", "ino": "0x1", "filename": "/data/app/music.db", "size": 8192}, "0:5|0x3": {"dev": "0:5", "ino": "0x3", "filename": "/tmp/short.txt", "size": 4096}}, "series": [{"t": 80.5, "total": 0, "byFile": {"260:69|0x1": 0, "260:69|0x2": 0, "0:5|0x3": 0}, "byPid": {"loader": 0, "music": 0, "chat": 0, "scanner": 0, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 0, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 0, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 82.5, "total": 2, "byFile": {"260:69|0x1": 2, "260:69|0x2": 0, "0:5|0x3": 0}, "byPid": {"loader": 2, "music": 0, "chat": 0, "scanner": 0, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 2, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 0, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 84.5, "total": 2, "byFile": {"260:69|0x1": 2, "260:69|0x2": 0, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 1, "chat": 0, "scanner": 0, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 1, "260:69|0x2\u001fchat": 0, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 86.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 1, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 1, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 88.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 1, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 1, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 90.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 1, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 92.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 1, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 94.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 1, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 96.5, "total": 4, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 1}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 1, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 1, "0:5|0x3\u001ftmpd": 1, "260:69|0x2\u001fsyncer": 0}}, {"t": 98.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 1, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 100.5, "total": 4, "byFile": {"260:69|0x1": 2, "260:69|0x2": 2, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 1}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 1, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 1}}, {"t": 102.5, "total": 3, "byFile": {"260:69|0x1": 1, "260:69|0x2": 2, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 1}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 1}}, {"t": 104.5, "total": 3, "byFile": {"260:69|0x1": 1, "260:69|0x2": 2, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 1}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 1}}, {"t": 106.5, "total": 2, "byFile": {"260:69|0x1": 0, "260:69|0x2": 2, "0:5|0x3": 0}, "byPid": {"loader": 0, "music": 0, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 1}, "byFilePid": {"260:69|0x1\u001floader": 0, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 1}}], "lanes": [{"id": "260:69|0x1|0", "dev": "260:69", "ino": "0x1", "ofs": 0, "pageIndex": 0, "fileKey": "260:69|0x1", "fileLabel": "/data/app/music.db", "segments": [{"start": 80.5, "end": 84.0, "fileKey": "260:69|0x1", "pidName": "loader", "reason": "pid_change", "accessCount": 1}, {"start": 84.0, "end": 89.0, "fileKey": "260:69|0x1", "pidName": "music", "reason": "pid_change", "accessCount": 1}, {"start": 89.0, "end": 101.0, "fileKey": "260:69|0x1", "pidName": "scanner", "reason": "delete", "accessCount": 0}], "events": [{"t": 80.5, "kind": "add", "pidName": "loader"}, {"t": 84.0, "kind": "access", "pidName": "music"}, {"t": 89.0, "kind": "access", "pidName": "scanner"}, {"t": 101.0, "kind": "delete", "pidName": "reclaim"}]}, {"id": "260:69|0x2|0", "dev": "260:69", "ino": "0x2", "ofs": 0, "pageIndex": 0, "fileKey": "260:69|0x2", "fileLabel": "/data/app/chat.log", "segments": [{"start": 85.0, "end": 108.0, "fileKey": "260:69|0x2", "pidName": "chat", "reason": "delete", "accessCount": 1}], "events": [{"t": 85.0, "kind": "add", "pidName": "chat"}, {"t": 93.0, "kind": "access", "pidName": "chat"}, {"t": 108.0, "kind": "delete", "pidName": "reclaim"}]}, {"id": "260:69|0x1|4096", "dev": "260:69", "ino": "0x1", "ofs": 4096, "pageIndex": 1, "fileKey": "260:69|0x1", "fileLabel": "/data/app/music.db", "segments": [{"start": 82.0, "end": 106.0, "fileKey": "260:69|0x1", "pidName": "loader", "reason": "delete", "accessCount": 0}], "events": [{"t": 82.0, "kind": "add", "pidName": "loader"}, {"t": 106.0, "kind": "delete", "pidName": "reclaim"}]}, {"id": "0:5|0x3|0", "dev": "0:5", "ino": "0x3", "ofs": 0, "pageIndex": 0, "fileKey": "0:5|0x3", "fileLabel": "/tmp/short.txt", "segments": [{"start": 95.0, "end": 97.0, "fileKey": "0:5|0x3", "pidName": "tmpd", "reason": "delete", "accessCount": 0}], "events": [{"t": 95.0, "kind": "add", "pidName": "tmpd"}, {"t": 97.0, "kind": "delete", "pidName": "tmpd"}]}], "timesteps": [{"timestamp": 90.0, "step": "open music"}, {"timestamp": 100.0, "step": "open chat"}]}</script>
+<script id="fscache-data" type="application/json">{"metadata": {"dbPath": "/Users/gavinliu/Documents/Codex/2026-06-30/db-users-gavinliu-downloads-fscachedb-md/work/sample_fscache.db", "start": 80.5, "end": 108.0, "bucketSeconds": 2.0, "pageSize": 4096, "includeAccess": true, "eventLimit": null, "totalEvents": 13, "openPagesAtEnd": 1, "anomalies": {}}, "groups": {"files": [{"key": "260:69|0x1", "label": "/data/app/music.db"}, {"key": "260:69|0x2", "label": "/data/app/chat.log"}, {"key": "0:5|0x3", "label": "/tmp/short.txt"}], "pids": [{"key": "loader", "label": "loader"}, {"key": "music", "label": "music"}, {"key": "chat", "label": "chat"}, {"key": "scanner", "label": "scanner"}, {"key": "tmpd", "label": "tmpd"}, {"key": "syncer", "label": "syncer"}], "filePids": [{"key": "260:69|0x1\u001floader", "label": "/data/app/music.db · loader"}, {"key": "260:69|0x1\u001fmusic", "label": "/data/app/music.db · music"}, {"key": "260:69|0x2\u001fchat", "label": "/data/app/chat.log · chat"}, {"key": "260:69|0x1\u001fscanner", "label": "/data/app/music.db · scanner"}, {"key": "0:5|0x3\u001ftmpd", "label": "/tmp/short.txt · tmpd"}, {"key": "260:69|0x2\u001fsyncer", "label": "/data/app/chat.log · syncer"}]}, "fileMeta": {"260:69|0x1": {"dev": "260:69", "ino": "0x1", "filename": "/data/app/music.db", "size": 8192}, "260:69|0x2": {"dev": "260:69", "ino": "0x2", "filename": "/data/app/chat.log", "size": 12288}, "0:5|0x3": {"dev": "0:5", "ino": "0x3", "filename": "/tmp/short.txt", "size": 4096}}, "series": [{"t": 80.5, "total": 0, "byFile": {"260:69|0x1": 0, "260:69|0x2": 0, "0:5|0x3": 0}, "byPid": {"loader": 0, "music": 0, "chat": 0, "scanner": 0, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 0, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 0, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 82.5, "total": 2, "byFile": {"260:69|0x1": 2, "260:69|0x2": 0, "0:5|0x3": 0}, "byPid": {"loader": 2, "music": 0, "chat": 0, "scanner": 0, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 2, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 0, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 84.5, "total": 2, "byFile": {"260:69|0x1": 2, "260:69|0x2": 0, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 1, "chat": 0, "scanner": 0, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 1, "260:69|0x2\u001fchat": 0, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 86.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 1, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 1, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 88.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 1, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 1, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 90.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 1, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 92.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 1, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 94.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 1, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 96.5, "total": 4, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 1}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 1, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 1, "0:5|0x3\u001ftmpd": 1, "260:69|0x2\u001fsyncer": 0}}, {"t": 98.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 0}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 1, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 0}}, {"t": 100.5, "total": 4, "byFile": {"260:69|0x1": 2, "260:69|0x2": 2, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 1}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 1, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 1}}, {"t": 102.5, "total": 3, "byFile": {"260:69|0x1": 1, "260:69|0x2": 2, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 1}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 1}}, {"t": 104.5, "total": 3, "byFile": {"260:69|0x1": 1, "260:69|0x2": 2, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 1}, "byFilePid": {"260:69|0x1\u001floader": 1, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 1}}, {"t": 106.5, "total": 2, "byFile": {"260:69|0x1": 0, "260:69|0x2": 2, "0:5|0x3": 0}, "byPid": {"loader": 0, "music": 0, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 1}, "byFilePid": {"260:69|0x1\u001floader": 0, "260:69|0x1\u001fmusic": 0, "260:69|0x2\u001fchat": 1, "260:69|0x1\u001fscanner": 0, "0:5|0x3\u001ftmpd": 0, "260:69|0x2\u001fsyncer": 1}}], "lanes": [{"id": "260:69|0x1|0", "dev": "260:69", "ino": "0x1", "ofs": 0, "pageIndex": 0, "fileKey": "260:69|0x1", "fileLabel": "/data/app/music.db", "segments": [{"start": 80.5, "end": 84.0, "fileKey": "260:69|0x1", "pidName": "loader", "reason": "pid_change", "accessCount": 1, "firstAccess": 84.0, "accessDelay": 3.5, "residentDuration": 3.5, "accessDelayRatio": 1.0}, {"start": 84.0, "end": 89.0, "fileKey": "260:69|0x1", "pidName": "music", "reason": "pid_change", "accessCount": 1, "firstAccess": 89.0, "accessDelay": 5.0, "residentDuration": 5.0, "accessDelayRatio": 1.0}, {"start": 89.0, "end": 101.0, "fileKey": "260:69|0x1", "pidName": "scanner", "reason": "delete", "accessCount": 0, "firstAccess": null, "accessDelay": null, "residentDuration": 12.0, "accessDelayRatio": null}], "events": [{"t": 80.5, "kind": "add", "pidName": "loader"}, {"t": 84.0, "kind": "access", "pidName": "music"}, {"t": 89.0, "kind": "access", "pidName": "scanner"}, {"t": 101.0, "kind": "delete", "pidName": "reclaim"}]}, {"id": "260:69|0x2|0", "dev": "260:69", "ino": "0x2", "ofs": 0, "pageIndex": 0, "fileKey": "260:69|0x2", "fileLabel": "/data/app/chat.log", "segments": [{"start": 85.0, "end": 108.0, "fileKey": "260:69|0x2", "pidName": "chat", "reason": "delete", "accessCount": 1, "firstAccess": 93.0, "accessDelay": 8.0, "residentDuration": 23.0, "accessDelayRatio": 0.347826}], "events": [{"t": 85.0, "kind": "add", "pidName": "chat"}, {"t": 93.0, "kind": "access", "pidName": "chat"}, {"t": 108.0, "kind": "delete", "pidName": "reclaim"}]}, {"id": "260:69|0x1|4096", "dev": "260:69", "ino": "0x1", "ofs": 4096, "pageIndex": 1, "fileKey": "260:69|0x1", "fileLabel": "/data/app/music.db", "segments": [{"start": 82.0, "end": 106.0, "fileKey": "260:69|0x1", "pidName": "loader", "reason": "delete", "accessCount": 0, "firstAccess": null, "accessDelay": null, "residentDuration": 24.0, "accessDelayRatio": null}], "events": [{"t": 82.0, "kind": "add", "pidName": "loader"}, {"t": 106.0, "kind": "delete", "pidName": "reclaim"}]}, {"id": "0:5|0x3|0", "dev": "0:5", "ino": "0x3", "ofs": 0, "pageIndex": 0, "fileKey": "0:5|0x3", "fileLabel": "/tmp/short.txt", "segments": [{"start": 95.0, "end": 97.0, "fileKey": "0:5|0x3", "pidName": "tmpd", "reason": "delete", "accessCount": 0, "firstAccess": null, "accessDelay": null, "residentDuration": 2.0, "accessDelayRatio": null}], "events": [{"t": 95.0, "kind": "add", "pidName": "tmpd"}, {"t": 97.0, "kind": "delete", "pidName": "tmpd"}]}], "timesteps": [{"timestamp": 90.0, "step": "open music"}, {"timestamp": 100.0, "step": "open chat"}]}</script>
 <script>
 const data = JSON.parse(document.getElementById('fscache-data').textContent);
 let mode = 'file';
 let filter = '';
+let selectedSummary = null;
+let laneLimit = 240;
+let ratioMin = 0;
+let ratioMax = 1;
 const palette = [
   '#0f766e','#b42318','#1d4ed8','#ca8a04','#7c3aed','#15803d','#be185d',
   '#0e7490','#9a3412','#4338ca','#4d7c0f','#a21caf','#0369a1','#c2410c',
@@ -235,6 +282,87 @@ function modeLabel() {
 function labelForKey(key) {
   const found = groupList().find(g => g.key === key);
   return found ? found.label : key;
+}
+function actualGroupKeys(groupMode) {
+  const groups = groupMode === 'file'
+    ? data.groups.files
+    : (groupMode === 'pid' ? data.groups.pids : (data.groups.filePids || []));
+  return groups.filter(g => g.key !== '__other__').map(g => g.key);
+}
+function laneMatchesSummary(lane) {
+  if (!selectedSummary || !selectedSummary.key) return true;
+  const key = selectedSummary.key;
+  if (selectedSummary.mode === 'file') {
+    if (key === '__other__') return !actualGroupKeys('file').includes(lane.fileKey);
+    return lane.fileKey === key;
+  }
+  if (selectedSummary.mode === 'pid') {
+    const pids = (lane.segments || []).map(s => s.pidName);
+    if (key === '__other__') return pids.some(pid => !actualGroupKeys('pid').includes(pid));
+    return pids.includes(key);
+  }
+  const combos = (lane.segments || []).map(s => filePidKey(s.fileKey, s.pidName));
+  if (key === '__other__') return combos.some(combo => !actualGroupKeys('filePid').includes(combo));
+  return combos.includes(key);
+}
+function laneMatchesRatio(lane) {
+  const constrained = ratioMin > 0 || ratioMax < 1;
+  let hasAccessSegment = false;
+  for (const seg of lane.segments || []) {
+    if (seg.accessDelayRatio == null) continue;
+    hasAccessSegment = true;
+    if (seg.accessDelayRatio >= ratioMin && seg.accessDelayRatio <= ratioMax) return true;
+  }
+  return constrained ? false : true;
+}
+function renderSelection() {
+  const el = document.getElementById('selectionPill');
+  if (!selectedSummary) {
+    el.innerHTML = '<span class="muted">未选中上图分组</span>';
+    return;
+  }
+  el.innerHTML = `<span><b>${escapeHtml(selectedSummary.modeLabel)}</b> ${escapeHtml(selectedSummary.label)}</span>` +
+    `<button id="clearSelection" type="button">×</button>`;
+  document.getElementById('clearSelection').onclick = () => {
+    selectedSummary = null;
+    renderSelection();
+    drawLife();
+  };
+}
+function summaryHitFromEvent(e) {
+  const chart = window.__summaryChart;
+  if (!chart || !data.series?.length) return null;
+  const rect = e.currentTarget.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  const {pad, iw, ih, start, end, maxY} = chart;
+  if (x < pad.l || x > rect.width - pad.r || y < pad.t || y > rect.height - pad.b) return null;
+  const t = start + ((x - pad.l) / Math.max(iw, 1)) * Math.max(end - start, .001);
+  let index = 0;
+  let best = Infinity;
+  for (let i = 0; i < data.series.length; i++) {
+    const delta = Math.abs(data.series[i].t - t);
+    if (delta < best) { best = delta; index = i; }
+  }
+  const s = data.series[index];
+  const targetValue = maxY * (1 - (y - pad.t) / Math.max(ih, 1));
+  let base = 0;
+  for (const g of groupList()) {
+    const count = seriesBucket(s)[g.key] || 0;
+    if (count > 0 && targetValue >= base && targetValue <= base + count) {
+      return {
+        key: g.key,
+        label: labelForKey(g.key),
+        count,
+        total: s.total,
+        t: s.t,
+        index,
+        mode,
+        modeLabel: modeLabel(),
+      };
+    }
+    base += count;
+  }
+  return {key: null, label: 'total resident pages', count: s.total, total: s.total, t: s.t, index, mode, modeLabel: modeLabel()};
 }
 function installStats() {
   const m = data.metadata;
@@ -318,8 +446,9 @@ function drawSummary() {
 }
 function filteredLanes() {
   const q = filter.trim().toLowerCase();
-  if (!q) return data.lanes || [];
   return (data.lanes || []).filter(l => {
+    if (!laneMatchesSummary(l) || !laneMatchesRatio(l)) return false;
+    if (!q) return true;
     const hay = [
       l.id, l.fileLabel, l.fileKey,
       ...(l.segments || []).map(s => s.pidName)
@@ -329,13 +458,15 @@ function filteredLanes() {
 }
 function drawLife() {
   const canvas = document.getElementById('lifeCanvas');
-  const {ctx, w, h} = resizeCanvas(canvas);
-  const lanes = filteredLanes();
+  const allLanes = filteredLanes();
+  const lanes = allLanes.slice(0, laneLimit);
   const start = data.metadata.start;
   const end = data.metadata.end;
   const pad = {l: 210, r: 18, t: 16, b: 30};
-  const rowH = Math.max(10, Math.min(24, (h - pad.t - pad.b) / Math.max(lanes.length, 1)));
-  const visible = Math.min(lanes.length, Math.floor((h - pad.t - pad.b) / rowH));
+  const rowH = 18;
+  canvas.style.height = Math.max(300, pad.t + lanes.length * rowH + pad.b) + 'px';
+  const {ctx, w, h} = resizeCanvas(canvas);
+  const visible = lanes.length;
   const iw = w - pad.l - pad.r;
   window.__hitSegments = [];
   ctx.clearRect(0, 0, w, h);
@@ -369,6 +500,24 @@ function drawLife() {
       ctx.globalAlpha = .86;
       ctx.fillRect(Math.max(pad.l, x1), y + 2, Math.max(1, x2 - x1), Math.max(4, rowH - 4));
       ctx.globalAlpha = 1;
+      if (seg.firstAccess != null) {
+        const xa = pad.l + ((seg.firstAccess - start) / Math.max(end - start, .001)) * iw;
+        ctx.fillStyle = 'rgba(255, 255, 255, .58)';
+        ctx.fillRect(Math.max(pad.l, x1), y + 4, Math.max(1, xa - x1), Math.max(2, rowH - 8));
+        ctx.strokeStyle = '#111827';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(xa, y + 1);
+        ctx.lineTo(xa, y + rowH - 1);
+        ctx.stroke();
+        ctx.fillStyle = '#111827';
+        ctx.beginPath();
+        ctx.moveTo(xa, y + 1);
+        ctx.lineTo(xa - 4, y + 7);
+        ctx.lineTo(xa + 4, y + 7);
+        ctx.closePath();
+        ctx.fill();
+      }
       window.__hitSegments.push({x1, x2, y1: y, y2: y + rowH, lane, seg});
     }
     for (const ev of lane.events || []) {
@@ -395,6 +544,8 @@ function drawLife() {
     ctx.font = '14px "Avenir Next", sans-serif';
     ctx.fillText('没有匹配的生命周期条带', 18, 48);
   }
+  document.getElementById('lifeLabel').textContent =
+    `显示 ${fmt(lanes.length)} / ${fmt(allLanes.length)} 条；横轴为 timestamp；亮色段为 add→first access`;
 }
 function drawLegend() {
   const groups = groupList().slice(0, 28);
@@ -420,48 +571,38 @@ document.getElementById('modeFilePid').onclick = () => {
   setMode('filePid');
 };
 document.getElementById('search').oninput = (e) => { filter = e.target.value; drawLife(); };
+document.getElementById('laneLimit').oninput = (e) => {
+  laneLimit = Math.max(20, Math.min(5000, Number(e.target.value) || 240));
+  drawLife();
+};
+document.getElementById('ratioMin').oninput = (e) => {
+  ratioMin = Math.max(0, Math.min(1, (Number(e.target.value) || 0) / 100));
+  drawLife();
+};
+document.getElementById('ratioMax').oninput = (e) => {
+  ratioMax = Math.max(0, Math.min(1, (Number(e.target.value) || 100) / 100));
+  drawLife();
+};
 document.getElementById('summaryCanvas').addEventListener('mousemove', (e) => {
   const tip = document.getElementById('tip');
-  const chart = window.__summaryChart;
-  if (!chart || !data.series?.length) { tip.style.display = 'none'; return; }
-  const rect = e.currentTarget.getBoundingClientRect();
-  const x = e.clientX - rect.left, y = e.clientY - rect.top;
-  const {pad, iw, ih, start, end, maxY} = chart;
-  if (x < pad.l || x > rect.width - pad.r || y < pad.t || y > rect.height - pad.b) {
-    tip.style.display = 'none';
-    return;
-  }
-  const t = start + ((x - pad.l) / Math.max(iw, 1)) * Math.max(end - start, .001);
-  let index = 0;
-  let best = Infinity;
-  for (let i = 0; i < data.series.length; i++) {
-    const delta = Math.abs(data.series[i].t - t);
-    if (delta < best) { best = delta; index = i; }
-  }
-  const s = data.series[index];
-  const targetValue = maxY * (1 - (y - pad.t) / Math.max(ih, 1));
-  let base = 0;
-  let hitKey = null;
-  let hitCount = 0;
-  for (const g of groupList()) {
-    const count = seriesBucket(s)[g.key] || 0;
-    if (count > 0 && targetValue >= base && targetValue <= base + count) {
-      hitKey = g.key;
-      hitCount = count;
-      break;
-    }
-    base += count;
-  }
-  const label = hitKey ? labelForKey(hitKey) : 'total resident pages';
-  const pct = s.total ? (hitCount * 100 / s.total).toFixed(1) : '0.0';
-  tip.innerHTML = `<b>${escapeHtml(modeLabel())}</b><br>` +
-    `<span class="muted">${timeFmt(s.t)} · bucket ${index + 1}/${data.series.length}</span><br>` +
-    `${escapeHtml(label)}<br>` +
-    `pages: <b>${fmt(hitKey ? hitCount : s.total)}</b>` +
-    (hitKey ? ` · total: ${fmt(s.total)} · ${pct}%` : '');
+  const hit = summaryHitFromEvent(e);
+  if (!hit) { tip.style.display = 'none'; return; }
+  const pct = hit.total ? (hit.count * 100 / hit.total).toFixed(1) : '0.0';
+  tip.innerHTML = `<b>${escapeHtml(hit.modeLabel)}</b><br>` +
+    `<span class="muted">${timeFmt(hit.t)} · bucket ${hit.index + 1}/${data.series.length}</span><br>` +
+    `${escapeHtml(hit.label)}<br>` +
+    `pages: <b>${fmt(hit.count)}</b>` +
+    (hit.key ? ` · total: ${fmt(hit.total)} · ${pct}%` : '');
   tip.style.left = Math.min(window.innerWidth - 540, e.clientX + 14) + 'px';
   tip.style.top = Math.min(window.innerHeight - 120, e.clientY + 14) + 'px';
   tip.style.display = 'block';
+});
+document.getElementById('summaryCanvas').addEventListener('click', (e) => {
+  const hit = summaryHitFromEvent(e);
+  if (!hit || !hit.key) return;
+  selectedSummary = hit;
+  renderSelection();
+  drawLife();
 });
 document.getElementById('summaryCanvas').addEventListener('mouseleave', () => {
   document.getElementById('tip').style.display = 'none';
@@ -475,7 +616,10 @@ document.getElementById('lifeCanvas').addEventListener('mousemove', (e) => {
   tip.innerHTML = `<b>${escapeHtml(hit.lane.fileLabel)}</b><br>` +
     `<span class="muted">${escapeHtml(hit.lane.id)}</span><br>` +
     `pid_name: ${escapeHtml(hit.seg.pidName)}<br>` +
-    `${timeFmt(hit.seg.start)} - ${timeFmt(hit.seg.end)} · access ${fmt(hit.seg.accessCount)}`;
+    `${timeFmt(hit.seg.start)} - ${timeFmt(hit.seg.end)} · access ${fmt(hit.seg.accessCount)}<br>` +
+    (hit.seg.firstAccess == null
+      ? '<span class="muted">no access in this resident interval</span>'
+      : `first access: ${timeFmt(hit.seg.firstAccess)} · delay ${timeFmt(hit.seg.accessDelay)} / resident ${timeFmt(hit.seg.residentDuration)} · ratio ${(hit.seg.accessDelayRatio * 100).toFixed(1)}%`);
   tip.style.left = Math.min(window.innerWidth - 540, e.clientX + 14) + 'px';
   tip.style.top = Math.min(window.innerHeight - 120, e.clientY + 14) + 'px';
   tip.style.display = 'block';
@@ -485,6 +629,7 @@ document.getElementById('lifeCanvas').addEventListener('mouseleave', () => {
 });
 window.addEventListener('resize', redraw);
 installStats();
+renderSelection();
 redraw();
 </script>
 </body>
