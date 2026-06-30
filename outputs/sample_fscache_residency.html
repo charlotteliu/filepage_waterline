@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>File Page Cache Residency</title>
+<style>
+:root {
+  color-scheme: light;
+  --ink: #16211f;
+  --muted: #66706d;
+  --line: #cfd8d3;
+  --panel: #f7f4ee;
+  --paper: #fffdf8;
+  --accent: #0f766e;
+  --danger: #b42318;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: ui-sans-serif, "Avenir Next", "Helvetica Neue", Helvetica, sans-serif;
+}
+header {
+  padding: 20px 24px 12px;
+  border-bottom: 1px solid var(--line);
+  background: #f2efe8;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+h1 {
+  margin: 0 0 12px;
+  font-size: 22px;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  align-items: center;
+}
+.segmented {
+  display: inline-grid;
+  grid-auto-flow: column;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  background: #fffaf0;
+  border-radius: 8px;
+}
+button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 8px 11px;
+  min-width: 72px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+}
+button.active {
+  background: var(--ink);
+  color: white;
+}
+input[type="search"] {
+  width: min(420px, 100%);
+  border: 1px solid var(--line);
+  background: white;
+  border-radius: 7px;
+  padding: 9px 11px;
+  font-size: 13px;
+}
+main { padding: 18px 24px 28px; }
+.stats {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(130px, 1fr));
+  gap: 10px;
+  margin-bottom: 18px;
+}
+.stat {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fbfaf6;
+}
+.stat b { display: block; font-size: 18px; margin-top: 2px; }
+.stat span { color: var(--muted); font-size: 12px; }
+.canvas-wrap {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: white;
+  margin-bottom: 16px;
+}
+.canvas-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--line);
+  background: #fbfaf6;
+}
+.canvas-title strong { font-size: 14px; }
+.canvas-title small { color: var(--muted); }
+canvas {
+  display: block;
+  width: 100%;
+}
+#summaryCanvas { height: 260px; }
+#lifeCanvas { height: 620px; }
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 12px;
+  margin: 10px 0 18px;
+  font-size: 12px;
+}
+.swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  display: inline-block;
+  margin-right: 5px;
+  vertical-align: -1px;
+}
+.tip {
+  position: fixed;
+  display: none;
+  pointer-events: none;
+  max-width: 520px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(255, 253, 248, .97);
+  box-shadow: 0 8px 24px rgba(22, 33, 31, .13);
+  font-size: 12px;
+  z-index: 20;
+}
+.muted { color: var(--muted); }
+@media (max-width: 760px) {
+  header, main { padding-left: 14px; padding-right: 14px; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  #lifeCanvas { height: 520px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>File Page Cache Residency</h1>
+  <div class="toolbar">
+    <div class="segmented" aria-label="color mode">
+      <button id="modeFile" class="active" type="button">文件颜色</button>
+      <button id="modePid" type="button">pid_name 颜色</button>
+    </div>
+    <input id="search" type="search" placeholder="过滤生命周期条带：filename / pid_name / dev:ino:ofs">
+  </div>
+</header>
+<main>
+  <section class="stats" id="stats"></section>
+  <section class="canvas-wrap">
+    <div class="canvas-title">
+      <strong>整机 resident page 数量</strong>
+      <small id="summaryLabel"></small>
+    </div>
+    <canvas id="summaryCanvas"></canvas>
+  </section>
+  <div class="legend" id="legend"></div>
+  <section class="canvas-wrap">
+    <div class="canvas-title">
+      <strong>抽样文件页驻留生命周期</strong>
+      <small>横轴为 timestamp；条带表示 resident，短线表示 add/access/delete</small>
+    </div>
+    <canvas id="lifeCanvas"></canvas>
+  </section>
+</main>
+<div class="tip" id="tip"></div>
+<script id="fscache-data" type="application/json">{"metadata": {"dbPath": "/Users/gavinliu/Documents/Codex/2026-06-30/db-users-gavinliu-downloads-fscachedb-md/work/sample_fscache.db", "start": 80.5, "end": 108.0, "bucketSeconds": 2.0, "pageSize": 4096, "includeAccess": true, "eventLimit": null, "totalEvents": 13, "openPagesAtEnd": 1, "anomalies": {}}, "groups": {"files": [{"key": "260:69|0x1", "label": "/data/app/music.db"}, {"key": "260:69|0x2", "label": "/data/app/chat.log"}, {"key": "0:5|0x3", "label": "/tmp/short.txt"}], "pids": [{"key": "loader", "label": "loader"}, {"key": "music", "label": "music"}, {"key": "chat", "label": "chat"}, {"key": "scanner", "label": "scanner"}, {"key": "tmpd", "label": "tmpd"}, {"key": "syncer", "label": "syncer"}]}, "fileMeta": {"260:69|0x1": {"dev": "260:69", "ino": "0x1", "filename": "/data/app/music.db", "size": 8192}, "260:69|0x2": {"dev": "260:69", "ino": "0x2", "filename": "/data/app/chat.log", "size": 12288}, "0:5|0x3": {"dev": "0:5", "ino": "0x3", "filename": "/tmp/short.txt", "size": 4096}}, "series": [{"t": 80.5, "total": 0, "byFile": {"260:69|0x1": 0, "260:69|0x2": 0, "0:5|0x3": 0}, "byPid": {"loader": 0, "music": 0, "chat": 0, "scanner": 0, "tmpd": 0, "syncer": 0}}, {"t": 82.5, "total": 2, "byFile": {"260:69|0x1": 2, "260:69|0x2": 0, "0:5|0x3": 0}, "byPid": {"loader": 2, "music": 0, "chat": 0, "scanner": 0, "tmpd": 0, "syncer": 0}}, {"t": 84.5, "total": 2, "byFile": {"260:69|0x1": 2, "260:69|0x2": 0, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 1, "chat": 0, "scanner": 0, "tmpd": 0, "syncer": 0}}, {"t": 86.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 1, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 0}}, {"t": 88.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 1, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 0}}, {"t": 90.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 0}}, {"t": 92.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 0}}, {"t": 94.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 0}}, {"t": 96.5, "total": 4, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 1}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 1, "syncer": 0}}, {"t": 98.5, "total": 3, "byFile": {"260:69|0x1": 2, "260:69|0x2": 1, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 0}}, {"t": 100.5, "total": 4, "byFile": {"260:69|0x1": 2, "260:69|0x2": 2, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 1, "tmpd": 0, "syncer": 1}}, {"t": 102.5, "total": 3, "byFile": {"260:69|0x1": 1, "260:69|0x2": 2, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 1}}, {"t": 104.5, "total": 3, "byFile": {"260:69|0x1": 1, "260:69|0x2": 2, "0:5|0x3": 0}, "byPid": {"loader": 1, "music": 0, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 1}}, {"t": 106.5, "total": 2, "byFile": {"260:69|0x1": 0, "260:69|0x2": 2, "0:5|0x3": 0}, "byPid": {"loader": 0, "music": 0, "chat": 1, "scanner": 0, "tmpd": 0, "syncer": 1}}], "lanes": [{"id": "260:69|0x1|0", "dev": "260:69", "ino": "0x1", "ofs": 0, "pageIndex": 0, "fileKey": "260:69|0x1", "fileLabel": "/data/app/music.db", "segments": [{"start": 80.5, "end": 84.0, "fileKey": "260:69|0x1", "pidName": "loader", "reason": "pid_change", "accessCount": 1}, {"start": 84.0, "end": 89.0, "fileKey": "260:69|0x1", "pidName": "music", "reason": "pid_change", "accessCount": 1}, {"start": 89.0, "end": 101.0, "fileKey": "260:69|0x1", "pidName": "scanner", "reason": "delete", "accessCount": 0}], "events": [{"t": 80.5, "kind": "add", "pidName": "loader"}, {"t": 84.0, "kind": "access", "pidName": "music"}, {"t": 89.0, "kind": "access", "pidName": "scanner"}, {"t": 101.0, "kind": "delete", "pidName": "reclaim"}]}, {"id": "260:69|0x2|0", "dev": "260:69", "ino": "0x2", "ofs": 0, "pageIndex": 0, "fileKey": "260:69|0x2", "fileLabel": "/data/app/chat.log", "segments": [{"start": 85.0, "end": 108.0, "fileKey": "260:69|0x2", "pidName": "chat", "reason": "delete", "accessCount": 1}], "events": [{"t": 85.0, "kind": "add", "pidName": "chat"}, {"t": 93.0, "kind": "access", "pidName": "chat"}, {"t": 108.0, "kind": "delete", "pidName": "reclaim"}]}, {"id": "260:69|0x1|4096", "dev": "260:69", "ino": "0x1", "ofs": 4096, "pageIndex": 1, "fileKey": "260:69|0x1", "fileLabel": "/data/app/music.db", "segments": [{"start": 82.0, "end": 106.0, "fileKey": "260:69|0x1", "pidName": "loader", "reason": "delete", "accessCount": 0}], "events": [{"t": 82.0, "kind": "add", "pidName": "loader"}, {"t": 106.0, "kind": "delete", "pidName": "reclaim"}]}, {"id": "0:5|0x3|0", "dev": "0:5", "ino": "0x3", "ofs": 0, "pageIndex": 0, "fileKey": "0:5|0x3", "fileLabel": "/tmp/short.txt", "segments": [{"start": 95.0, "end": 97.0, "fileKey": "0:5|0x3", "pidName": "tmpd", "reason": "delete", "accessCount": 0}], "events": [{"t": 95.0, "kind": "add", "pidName": "tmpd"}, {"t": 97.0, "kind": "delete", "pidName": "tmpd"}]}], "timesteps": [{"timestamp": 90.0, "step": "open music"}, {"timestamp": 100.0, "step": "open chat"}]}</script>
+<script>
+const data = JSON.parse(document.getElementById('fscache-data').textContent);
+let mode = 'file';
+let filter = '';
+const palette = [
+  '#0f766e','#b42318','#1d4ed8','#ca8a04','#7c3aed','#15803d','#be185d',
+  '#0e7490','#9a3412','#4338ca','#4d7c0f','#a21caf','#0369a1','#c2410c',
+  '#166534','#6d28d9','#be123c','#155e75','#854d0e','#1e40af'
+];
+
+function keyColor(key) {
+  if (key === '__other__') return '#9aa39f';
+  let h = 2166136261;
+  for (let i = 0; i < key.length; i++) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return palette[Math.abs(h) % palette.length];
+}
+function fmt(n) { return new Intl.NumberFormat('en-US').format(Math.round(n || 0)); }
+function timeFmt(t) { return Number(t).toFixed(3) + 's'; }
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function resizeCanvas(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+  canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w: rect.width, h: rect.height };
+}
+function groupList() {
+  return mode === 'file' ? data.groups.files : data.groups.pids;
+}
+function seriesBucket(s) {
+  return mode === 'file' ? s.byFile : s.byPid;
+}
+function installStats() {
+  const m = data.metadata;
+  const span = Math.max(0, m.end - m.start);
+  const peak = Math.max(...data.series.map(s => s.total), 0);
+  const anomalies = Object.values(m.anomalies || {}).reduce((a,b) => a + b, 0);
+  const stats = [
+    ['时间跨度', span.toFixed(3) + 's'],
+    ['事件数', fmt(m.totalEvents)],
+    ['峰值 resident pages', fmt(peak)],
+    ['结束仍驻留', fmt(m.openPagesAtEnd)],
+    ['异常事件', fmt(anomalies)]
+  ];
+  document.getElementById('stats').innerHTML = stats.map(([k,v]) =>
+    `<div class="stat"><span>${k}</span><b>${v}</b></div>`).join('');
+}
+function drawSummary() {
+  const canvas = document.getElementById('summaryCanvas');
+  const {ctx, w, h} = resizeCanvas(canvas);
+  const pad = {l: 54, r: 16, t: 16, b: 30};
+  const iw = w - pad.l - pad.r;
+  const ih = h - pad.t - pad.b;
+  const start = data.metadata.start;
+  const end = data.metadata.end;
+  const maxY = Math.max(1, ...data.series.map(s => s.total));
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = '#d9e0dc';
+  ctx.lineWidth = 1;
+  ctx.font = '12px "Avenir Next", sans-serif';
+  ctx.fillStyle = '#66706d';
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + ih * i / 4;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y); ctx.stroke();
+    const value = maxY * (1 - i / 4);
+    ctx.fillText(fmt(value), 8, y + 4);
+  }
+  for (const step of data.timesteps || []) {
+    const x = pad.l + ((step.timestamp - start) / Math.max(end - start, .001)) * iw;
+    if (x < pad.l || x > w - pad.r) continue;
+    ctx.strokeStyle = '#7b8790';
+    ctx.globalAlpha = .28;
+    ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, h - pad.b); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  const groups = groupList().map(g => g.key);
+  const bases = new Array(data.series.length).fill(0);
+  for (const key of groups) {
+    ctx.beginPath();
+    for (let i = 0; i < data.series.length; i++) {
+      const s = data.series[i];
+      const x = pad.l + ((s.t - start) / Math.max(end - start, .001)) * iw;
+      const y = pad.t + ih * (1 - (bases[i] + (seriesBucket(s)[key] || 0)) / maxY);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    for (let i = data.series.length - 1; i >= 0; i--) {
+      const s = data.series[i];
+      const x = pad.l + ((s.t - start) / Math.max(end - start, .001)) * iw;
+      const y = pad.t + ih * (1 - bases[i] / maxY);
+      ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.fillStyle = keyColor(key);
+    ctx.globalAlpha = key === '__other__' ? .33 : .72;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    for (let i = 0; i < data.series.length; i++) {
+      bases[i] += seriesBucket(data.series[i])[key] || 0;
+    }
+  }
+  ctx.strokeStyle = '#16211f';
+  ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, h - pad.b); ctx.lineTo(w - pad.r, h - pad.b); ctx.stroke();
+  ctx.fillStyle = '#66706d';
+  ctx.fillText(timeFmt(start), pad.l, h - 9);
+  ctx.textAlign = 'right';
+  ctx.fillText(timeFmt(end), w - pad.r, h - 9);
+  ctx.textAlign = 'left';
+  document.getElementById('summaryLabel').textContent = mode === 'file' ? '按文件分组' : '按 pid_name 分组';
+}
+function filteredLanes() {
+  const q = filter.trim().toLowerCase();
+  if (!q) return data.lanes || [];
+  return (data.lanes || []).filter(l => {
+    const hay = [
+      l.id, l.fileLabel, l.fileKey,
+      ...(l.segments || []).map(s => s.pidName)
+    ].join(' ').toLowerCase();
+    return hay.includes(q);
+  });
+}
+function drawLife() {
+  const canvas = document.getElementById('lifeCanvas');
+  const {ctx, w, h} = resizeCanvas(canvas);
+  const lanes = filteredLanes();
+  const start = data.metadata.start;
+  const end = data.metadata.end;
+  const pad = {l: 210, r: 18, t: 16, b: 30};
+  const rowH = Math.max(10, Math.min(24, (h - pad.t - pad.b) / Math.max(lanes.length, 1)));
+  const visible = Math.min(lanes.length, Math.floor((h - pad.t - pad.b) / rowH));
+  const iw = w - pad.l - pad.r;
+  window.__hitSegments = [];
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, w, h);
+  ctx.font = '11px "Avenir Next", sans-serif';
+  ctx.textBaseline = 'middle';
+  for (const step of data.timesteps || []) {
+    const x = pad.l + ((step.timestamp - start) / Math.max(end - start, .001)) * iw;
+    if (x < pad.l || x > w - pad.r) continue;
+    ctx.strokeStyle = '#7b8790';
+    ctx.globalAlpha = .22;
+    ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, h - pad.b); ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  for (let i = 0; i < visible; i++) {
+    const lane = lanes[i];
+    const y = pad.t + i * rowH;
+    if (i % 2 === 0) {
+      ctx.fillStyle = '#fbfaf6';
+      ctx.fillRect(0, y, w, rowH);
+    }
+    ctx.fillStyle = '#3d4744';
+    const label = `${lane.fileLabel} @${lane.ofs}`;
+    ctx.fillText(label.length > 34 ? label.slice(0, 31) + '...' : label, 10, y + rowH / 2);
+    for (const seg of lane.segments || []) {
+      const x1 = pad.l + ((seg.start - start) / Math.max(end - start, .001)) * iw;
+      const x2 = pad.l + ((seg.end - start) / Math.max(end - start, .001)) * iw;
+      const colorKey = mode === 'file' ? seg.fileKey : seg.pidName;
+      ctx.fillStyle = keyColor(colorKey);
+      ctx.globalAlpha = .86;
+      ctx.fillRect(Math.max(pad.l, x1), y + 2, Math.max(1, x2 - x1), Math.max(4, rowH - 4));
+      ctx.globalAlpha = 1;
+      window.__hitSegments.push({x1, x2, y1: y, y2: y + rowH, lane, seg});
+    }
+    for (const ev of lane.events || []) {
+      const x = pad.l + ((ev.t - start) / Math.max(end - start, .001)) * iw;
+      if (x < pad.l || x > w - pad.r) continue;
+      ctx.strokeStyle = ev.kind === 'delete' ? '#b42318' : (ev.kind === 'add' ? '#16211f' : '#ffffff');
+      ctx.lineWidth = ev.kind === 'access' ? 1 : 2;
+      ctx.beginPath();
+      ctx.moveTo(x, y + 2);
+      ctx.lineTo(x, y + rowH - 2);
+      ctx.stroke();
+    }
+  }
+  ctx.strokeStyle = '#16211f';
+  ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, h - pad.b); ctx.lineTo(w - pad.r, h - pad.b); ctx.stroke();
+  ctx.fillStyle = '#66706d';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(timeFmt(start), pad.l, h - 9);
+  ctx.textAlign = 'right';
+  ctx.fillText(timeFmt(end), w - pad.r, h - 9);
+  ctx.textAlign = 'left';
+  if (!lanes.length) {
+    ctx.fillStyle = '#66706d';
+    ctx.font = '14px "Avenir Next", sans-serif';
+    ctx.fillText('没有匹配的生命周期条带', 18, 48);
+  }
+}
+function drawLegend() {
+  const groups = groupList().slice(0, 28);
+  document.getElementById('legend').innerHTML = groups.map(g =>
+    `<span title="${escapeHtml(g.label)}"><i class="swatch" style="background:${keyColor(g.key)}"></i>${escapeHtml(g.label)}</span>`
+  ).join('');
+}
+function redraw() { drawSummary(); drawLegend(); drawLife(); }
+document.getElementById('modeFile').onclick = () => {
+  mode = 'file';
+  document.getElementById('modeFile').classList.add('active');
+  document.getElementById('modePid').classList.remove('active');
+  redraw();
+};
+document.getElementById('modePid').onclick = () => {
+  mode = 'pid';
+  document.getElementById('modePid').classList.add('active');
+  document.getElementById('modeFile').classList.remove('active');
+  redraw();
+};
+document.getElementById('search').oninput = (e) => { filter = e.target.value; drawLife(); };
+document.getElementById('lifeCanvas').addEventListener('mousemove', (e) => {
+  const tip = document.getElementById('tip');
+  const rect = e.currentTarget.getBoundingClientRect();
+  const x = e.clientX - rect.left, y = e.clientY - rect.top;
+  const hit = (window.__hitSegments || []).find(s => x >= s.x1 && x <= s.x2 && y >= s.y1 && y <= s.y2);
+  if (!hit) { tip.style.display = 'none'; return; }
+  tip.innerHTML = `<b>${escapeHtml(hit.lane.fileLabel)}</b><br>` +
+    `<span class="muted">${escapeHtml(hit.lane.id)}</span><br>` +
+    `pid_name: ${escapeHtml(hit.seg.pidName)}<br>` +
+    `${timeFmt(hit.seg.start)} - ${timeFmt(hit.seg.end)} · access ${fmt(hit.seg.accessCount)}`;
+  tip.style.left = Math.min(window.innerWidth - 540, e.clientX + 14) + 'px';
+  tip.style.top = Math.min(window.innerHeight - 120, e.clientY + 14) + 'px';
+  tip.style.display = 'block';
+});
+document.getElementById('lifeCanvas').addEventListener('mouseleave', () => {
+  document.getElementById('tip').style.display = 'none';
+});
+window.addEventListener('resize', redraw);
+installStats();
+redraw();
+</script>
+</body>
+</html>
