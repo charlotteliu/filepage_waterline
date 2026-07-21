@@ -1120,14 +1120,33 @@ canvas {
 #heatmapCanvas { height: 520px; }
 #coldmapCanvas { height: 560px; }
 #lifeCanvas { height: 620px; }
+.coldmap-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  align-items: center;
+  padding: 10px 13px;
+  border-bottom: 1px solid var(--line);
+  background: #fbfaf6;
+  color: var(--muted);
+  font-size: 12px;
+}
+.coldmap-controls label { display: inline-flex; align-items: center; gap: 6px; }
+.coldmap-controls select {
+  border: 1px solid var(--line);
+  background: white;
+  border-radius: 6px;
+  padding: 5px 7px;
+  font-size: 12px;
+  color: var(--ink);
+}
 .coldbar {
-  height: 11px;
-  width: 150px;
+  height: 12px;
+  width: 168px;
   border-radius: 3px;
   border: 1px solid var(--line);
-  background: linear-gradient(90deg, #eef4f2 0%, #7fb3aa 45%, #0f766e 78%, #06403b 100%);
   display: inline-block;
-  vertical-align: -1px;
+  vertical-align: -2px;
 }
 .legend {
   display: flex;
@@ -1200,7 +1219,25 @@ canvas {
   <section class="canvas-wrap">
     <div class="canvas-title">
       <strong>整机文件页 冷热 · 驻留热力图</strong>
-      <small id="coldmapLabel">条带厚度=当前驻留页数，颜色=被访问页/驻留页占比（越浅越冷，越深越热）　冷 <span class="coldbar"></span> 热</small>
+      <small id="coldmapLabel">条带厚度=当前驻留页数（按页数真实缩放），颜色=被访问页/驻留页占比</small>
+    </div>
+    <div class="coldmap-controls">
+      <label>配色
+        <select id="coldPalette">
+          <option value="turbo">彩虹 Turbo（蓝→青→绿→黄→红）</option>
+          <option value="jet">蓝红 Jet（蓝→青→黄→红）</option>
+          <option value="inferno">火焰 Inferno（黑紫→红→黄）</option>
+          <option value="viridis">Viridis（紫→青→绿→黄）</option>
+          <option value="icefire">冰火（青→蓝→品红→橙）</option>
+        </select>
+      </label>
+      <label>色阶
+        <select id="coldRange">
+          <option value="adaptive">自适应（按数据范围铺满配色）</option>
+          <option value="absolute">绝对（0–100%）</option>
+        </select>
+      </label>
+      <span class="muted">冷 <span class="coldbar" id="coldbar"></span> 热</span>
     </div>
     <div class="scroll-canvas">
       <canvas id="coldmapCanvas"></canvas>
@@ -1232,6 +1269,8 @@ let selectedSummary = null;
 let laneLimit = 240;
 let ratioMin = 0;
 let ratioMax = 1;
+let coldPalette = 'turbo';
+let coldRange = 'adaptive';
 const palette = [
   '#0f766e','#b42318','#1d4ed8','#ca8a04','#7c3aed','#15803d','#be185d',
   '#0e7490','#9a3412','#4338ca','#4d7c0f','#a21caf','#0369a1','#c2410c',
@@ -1653,30 +1692,75 @@ function drawHeatmap() {
   document.getElementById('heatmapLabel').textContent =
     `显示 ${fmt(heatmap.files.length)} 个文件/inode；Y 轴按首次 add 时间排序；峰值 ${fmt(heatmap.max)} pages`;
 }
+// Vibrant cold->hot color scales (ratio 0 = cold, 1 = hot).
+const COLD_PALETTES = {
+  turbo: [[0,[48,18,59]],[0.2,[33,110,240]],[0.4,[27,215,180]],[0.55,[90,235,70]],[0.7,[230,215,30]],[0.85,[245,130,20]],[1,[165,25,20]]],
+  jet: [[0,[0,0,140]],[0.15,[0,60,255]],[0.35,[0,220,255]],[0.5,[120,255,120]],[0.65,[255,235,0]],[0.85,[255,90,0]],[1,[150,0,0]]],
+  inferno: [[0,[8,5,22]],[0.2,[60,15,110]],[0.4,[150,44,90]],[0.6,[225,90,50]],[0.8,[250,175,60]],[1,[252,240,160]]],
+  viridis: [[0,[68,1,84]],[0.25,[59,82,139]],[0.5,[33,145,140]],[0.75,[94,201,98]],[1,[253,231,37]]],
+  icefire: [[0,[0,225,235]],[0.3,[30,90,220]],[0.5,[25,20,60]],[0.7,[220,40,180]],[1,[255,150,40]]],
+};
+function lerpStops(stops, t) {
+  t = Math.max(0, Math.min(1, t));
+  for (let i = 1; i < stops.length; i++) {
+    if (t <= stops[i][0]) {
+      const p0 = stops[i-1][0], c0 = stops[i-1][1], p1 = stops[i][0], c1 = stops[i][1];
+      const k = (t - p0) / Math.max(p1 - p0, 1e-9);
+      return [Math.round(c0[0]+(c1[0]-c0[0])*k), Math.round(c0[1]+(c1[1]-c0[1])*k), Math.round(c0[2]+(c1[2]-c0[2])*k)];
+    }
+  }
+  const last = stops[stops.length-1][1];
+  return [last[0], last[1], last[2]];
+}
 function ratioColor(ratio) {
-  // ratio in [0,1]: 0 = cold (light) -> 1 = hot (dark teal).
-  const t = Math.max(0, Math.min(1, ratio));
-  const c0 = [238, 244, 242];  // #eef4f2 near-white
-  const c1 = [6, 64, 59];      // #06403b dark teal
-  const r = Math.round(c0[0] + (c1[0] - c0[0]) * t);
-  const g = Math.round(c0[1] + (c1[1] - c0[1]) * t);
-  const b = Math.round(c0[2] + (c1[2] - c0[2]) * t);
-  return `rgb(${r},${g},${b})`;
+  const c = lerpStops(COLD_PALETTES[coldPalette] || COLD_PALETTES.turbo, ratio);
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+function coldPaletteGradient() {
+  const stops = COLD_PALETTES[coldPalette] || COLD_PALETTES.turbo;
+  return 'linear-gradient(90deg,' + stops.map(s => `rgb(${s[1][0]},${s[1][1]},${s[1][2]}) ${Math.round(s[0]*100)}%`).join(',') + ')';
+}
+function updateColdbars() {
+  document.querySelectorAll('.coldbar').forEach(el => { el.style.background = coldPaletteGradient(); });
 }
 function drawColdmap() {
   const canvas = document.getElementById('coldmapCanvas');
   const heatmap = data.heatmap || {files: [], times: [], values: [], accessed: [], max: 0};
-  const rowH = 22;
   const pad = {l: 260, r: 18, t: 42, b: 30};
-  canvas.style.height = Math.max(320, pad.t + heatmap.files.length * rowH + pad.b) + 'px';
+  const files = heatmap.files;
+  const maxPeak = Math.max(1, heatmap.max || 0);
+  // Shared page->pixel scale for ALL inodes: the biggest inode's peak maps to
+  // targetMaxBand px, everyone else uses the SAME scale, so band thickness is a
+  // true, comparable measure of resident page count (not normalized per row).
+  const targetMaxBand = 72;
+  const pxPerPage = targetMaxBand / maxPeak;
+  const minRow = 13, rowGap = 3;
+  const slotH = files.map(f => Math.max(minRow, Math.round((f.peak || 0) * pxPerPage) + rowGap));
+  const totalH = slotH.reduce((a, b) => a + b, 0);
+  canvas.style.height = Math.max(320, pad.t + totalH + pad.b) + 'px';
   const {ctx, w, h} = resizeCanvas(canvas);
   const start = data.metadata.start;
   const end = data.metadata.end;
   const iw = w - pad.l - pad.r;
   const plotBottom = h - pad.b;
   const cellW = Math.max(1, iw / Math.max(heatmap.times.length, 1));
-  const maxPeak = Math.max(1, heatmap.max || 0);
-  window.__coldmapChart = {pad, w, h, rowH, start, end, cellW, maxPeak};
+  const rows = [];
+
+  // Color domain: in adaptive mode stretch the palette across the data's actual
+  // ratio range (98th pct) so cold/hot are clearly separated; absolute maps 0-100%.
+  let domainMax = 1;
+  if (coldRange === 'adaptive') {
+    const rr = [];
+    for (let r = 0; r < files.length; r++) {
+      const resid = heatmap.values[r] || [], acc = heatmap.accessed[r] || [];
+      for (let c = 0; c < resid.length; c++) {
+        const rv = resid[c] || 0;
+        if (rv > 0) rr.push(Math.min(1, (acc[c] || 0) / rv));
+      }
+    }
+    rr.sort((a, b) => a - b);
+    domainMax = rr.length ? Math.max(0.05, rr[Math.min(rr.length - 1, Math.floor(0.98 * rr.length))]) : 1;
+  }
 
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = '#ffffff';
@@ -1685,14 +1769,15 @@ function drawColdmap() {
   ctx.font = '11px "Avenir Next", sans-serif';
   ctx.textBaseline = 'middle';
 
-  const maxBand = rowH - 3;
-  for (let r = 0; r < heatmap.files.length; r++) {
-    const file = heatmap.files[r];
-    const y = pad.t + r * rowH;
-    const cy = y + rowH / 2;
+  let y = pad.t;
+  for (let r = 0; r < files.length; r++) {
+    const file = files[r];
+    const sh = slotH[r];
+    const cy = y + sh / 2;
+    rows.push({y0: y, y1: y + sh, r});
     if (r % 2 === 0) {
       ctx.fillStyle = '#fbfaf6';
-      ctx.fillRect(0, y, w, rowH);
+      ctx.fillRect(0, y, w, sh);
     }
     ctx.fillStyle = '#3d4744';
     const label = `${file.label}`;
@@ -1704,12 +1789,15 @@ function drawColdmap() {
       if (rv <= 0) continue;
       const av = acc[c] || 0;
       const ratio = Math.min(1, av / rv);
-      const th = Math.max(1, (rv / maxPeak) * maxBand);  // thickness = resident pages
+      const th = Math.max(1, rv * pxPerPage);   // thickness = real resident page count
       const x = pad.l + c * cellW;
-      ctx.fillStyle = ratioColor(ratio);            // color = accessed / resident
+      ctx.fillStyle = ratioColor(ratio / domainMax);   // color = accessed / resident
       ctx.fillRect(x, cy - th / 2, Math.max(1, cellW + .4), th);
     }
+    y += sh;
   }
+  window.__coldmapChart = {pad, w, h, start, end, cellW, maxPeak, pxPerPage, rows, times: heatmap.times};
+
   ctx.strokeStyle = '#16211f';
   ctx.beginPath();
   ctx.moveTo(pad.l, pad.t);
@@ -1722,8 +1810,10 @@ function drawColdmap() {
   ctx.textAlign = 'right';
   ctx.fillText(timeFmt(end), w - pad.r, h - 9);
   ctx.textAlign = 'left';
-  document.getElementById('coldmapLabel').innerHTML =
-    `条带厚度=当前驻留页数（全局最大 ${fmt(maxPeak)} 页），颜色=被访问页/驻留页占比（越浅越冷，越深越热）　冷 <span class="coldbar"></span> 热`;
+  updateColdbars();
+  const hotLabel = coldRange === 'adaptive' ? `热=${(domainMax * 100).toFixed(0)}%访问占比` : '热=100%访问占比';
+  document.getElementById('coldmapLabel').textContent =
+    `条带厚度=当前驻留页数（真实缩放：峰值 ${fmt(maxPeak)} 页 → ${targetMaxBand}px），颜色=被访问页/驻留页占比（左冷右热，${hotLabel}）`;
 }
 function drawLegend() {
   const groups = groupList().slice(0, 28);
@@ -1748,6 +1838,8 @@ document.getElementById('modePid').onclick = () => {
 document.getElementById('modeFilePid').onclick = () => {
   setMode('filePid');
 };
+document.getElementById('coldPalette').onchange = (e) => { coldPalette = e.target.value; drawColdmap(); };
+document.getElementById('coldRange').onchange = (e) => { coldRange = e.target.value; drawColdmap(); };
 document.getElementById('coldmapCanvas').addEventListener('mousemove', (e) => {
   const tip = document.getElementById('tip');
   const heatmap = data.heatmap || {files: [], times: [], values: [], accessed: []};
@@ -1755,12 +1847,14 @@ document.getElementById('coldmapCanvas').addEventListener('mousemove', (e) => {
   if (!chart || !heatmap.files.length || !heatmap.times.length) { tip.style.display = 'none'; return; }
   const rect = e.currentTarget.getBoundingClientRect();
   const x = e.clientX - rect.left, y = e.clientY - rect.top;
-  const {pad, rowH, cellW} = chart;
+  const {pad, cellW, rows} = chart;
   if (x < pad.l || x > rect.width - pad.r || y < pad.t || y > rect.height - pad.b) {
     tip.style.display = 'none';
     return;
   }
-  const rowIndex = Math.floor((y - pad.t) / rowH);
+  const hitRow = (rows || []).find(rr => y >= rr.y0 && y < rr.y1);
+  if (!hitRow) { tip.style.display = 'none'; return; }
+  const rowIndex = hitRow.r;
   const colIndex = Math.max(0, Math.min(heatmap.times.length - 1, Math.floor((x - pad.l) / Math.max(cellW, 1))));
   const file = heatmap.files[rowIndex];
   if (!file) { tip.style.display = 'none'; return; }
