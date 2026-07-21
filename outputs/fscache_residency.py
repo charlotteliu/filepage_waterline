@@ -719,25 +719,11 @@ def reconstruct(
     next_bucket = start_ts
     total_events = 0
 
-    # Whole-machine cold/hot accumulators, keyed by file (dev|ino).
-    #   file_ps    : resident page-seconds = integral of resident page count over time
-    #   file_peak  : peak simultaneously-resident pages
-    #   file_acc   : access events landing on a resident page of this file
-    #   file_adds  : add events (page loads / cache churn)
-    file_ps: Dict[str, float] = collections.defaultdict(float)
-    file_last: Dict[str, float] = {}
-    file_peak: Dict[str, int] = collections.defaultdict(int)
-    file_acc: Dict[str, int] = collections.defaultdict(int)
-    file_adds: Dict[str, int] = collections.defaultdict(int)
-
-    def flush_file(fk: str, ts: float) -> None:
-        # Integrate the current resident count of `fk` up to `ts`, then mark
-        # `ts` as the new reference. Call BEFORE mutating by_file[fk].
-        cur = by_file[fk]
-        if cur < 0:
-            cur = 0
-        file_ps[fk] += cur * (ts - file_last.get(fk, start_ts))
-        file_last[fk] = ts
+    # Cold/hot heatmap: per heatmap inode, the distinct resident page offsets
+    # that received an access within the current bucket (reset each snapshot).
+    # ratio = accessed pages / resident pages -> access temperature per cell.
+    heatmap_accessed_by_file: Dict[str, List[int]] = {k: [] for k in heatmap_files}
+    bucket_accessed: Dict[str, set] = {k: set() for k in heatmap_files}
 
     def emit_snapshot(ts: float) -> None:
         other_file = sum(max(0, v) for k, v in by_file.items() if k not in top_file_set)
@@ -769,6 +755,11 @@ def reconstruct(
             heatmap_values_by_file[key].append(value)
             if value > heatmap_peak_by_file[key]:
                 heatmap_peak_by_file[key] = value
+            accessed = bucket_accessed[key]
+            # Cap accessed at resident count (a page could be counted resident
+            # in the next bucket's snapshot); keeps ratio within [0, 1].
+            heatmap_accessed_by_file[key].append(min(len(accessed), value))
+            accessed.clear()
 
     def ensure_lane(page_key: PageKey) -> Optional[Dict[str, object]]:
         if page_key not in lane_order:
@@ -858,17 +849,12 @@ def reconstruct(
             if page_key in active:
                 close_lane_segment(page_key, ts, "duplicate_add")
                 old = active[page_key]
-                flush_file(old[S_FILE], ts)
                 by_file[old[S_FILE]] -= 1
                 by_pid[old[S_PID]] -= 1
                 by_file_pid[make_file_pid_key(old[S_FILE], old[S_PID])] -= 1
                 anomalies["duplicate_add_closed_previous"] += 1
             active[page_key] = [file_key, pid, ts, 0, None]
-            flush_file(file_key, ts)
             by_file[file_key] += 1
-            if by_file[file_key] > file_peak[file_key]:
-                file_peak[file_key] = by_file[file_key]
-            file_adds[file_key] += 1
             by_pid[pid] += 1
             by_file_pid[make_file_pid_key(file_key, pid)] += 1
             add_lane_event(page_key, ts, "add", pid)
@@ -879,7 +865,6 @@ def reconstruct(
                 anomalies["delete_without_active_add"] += 1
             else:
                 close_lane_segment(page_key, ts, "delete")
-                flush_file(state[S_FILE], ts)
                 by_file[state[S_FILE]] -= 1
                 by_pid[state[S_PID]] -= 1
                 by_file_pid[make_file_pid_key(state[S_FILE], state[S_PID])] -= 1
@@ -890,7 +875,8 @@ def reconstruct(
             if state is None:
                 anomalies["access_without_active_add"] += 1
             else:
-                file_acc[state[S_FILE]] += 1
+                if file_key in heatmap_file_set:
+                    bucket_accessed[file_key].add(ofs)
                 if state[S_SEGFIRST] is None:
                     state[S_SEGFIRST] = ts
                 state[S_SEGACC] += 1
@@ -911,38 +897,9 @@ def reconstruct(
         if page_key in lane_order:
             close_lane_segment(page_key, end_ts, "still_resident_at_end")
 
-    # Flush residency integrals of every file to the window end so that pages
-    # still resident at end-of-trace contribute their full footprint.
-    for fk in list(by_file.keys()):
-        flush_file(fk, end_ts)
-
-    # Rank files by residency footprint (page-seconds) for the cold/hot treemap.
-    span = max(end_ts - start_ts, 1e-9)
-    coldmap_raw: List[Dict[str, object]] = []
-    for fk, ps in file_ps.items():
-        peak = int(file_peak.get(fk, 0))
-        if ps <= 0 and peak <= 0:
-            continue
-        acc = int(file_acc.get(fk, 0))
-        coldmap_raw.append(
-            {
-                "key": fk,
-                "footprint": ps,                       # resident page-seconds
-                "peak": peak,                           # peak resident pages
-                "meanPages": ps / span,                 # avg resident pages
-                "accesses": acc,                        # access hits while resident
-                "adds": int(file_adds.get(fk, 0)),      # page loads
-                "density": (acc / ps) if ps > 0 else 0.0,       # accesses per page-second
-                "perPage": (acc / peak) if peak > 0 else 0.0,   # accesses per resident page
-            }
-        )
-    coldmap_raw.sort(key=lambda r: r["footprint"], reverse=True)
-    coldmap_raw = coldmap_raw[: args.max_coldmap_files]
-    coldmap_keys = {r["key"] for r in coldmap_raw}
-
     file_meta = {}
     file_keys_from_file_pid = {split_file_pid_key(key)[0] for key in top_file_pids if key != "__other__"}
-    for key in set(top_files) | set(heatmap_files) | coldmap_keys | file_keys_from_file_pid | {lane["fileKey"] for lane in lanes.values()}:
+    for key in set(top_files) | set(heatmap_files) | file_keys_from_file_pid | {lane["fileKey"] for lane in lanes.values()}:
         if key == "__other__":
             continue
         dev, ino = split_file_key(key)
@@ -965,27 +922,6 @@ def reconstruct(
         lanes[key]
         for key in sorted(lanes.keys(), key=lambda item: lane_order.get(item, 10**12))
     ]
-    coldmap_files = []
-    for r in coldmap_raw:
-        meta = file_meta.get(r["key"], {})
-        coldmap_files.append(
-            {
-                "key": r["key"],
-                "label": meta.get("filename", r["key"]),
-                "dev": meta.get("dev", split_file_key(r["key"])[0]),
-                "ino": meta.get("ino", split_file_key(r["key"])[1]),
-                "footprint": round(r["footprint"], 6),
-                "peak": r["peak"],
-                "meanPages": round(r["meanPages"], 4),
-                "accesses": r["accesses"],
-                "adds": r["adds"],
-                "density": round(r["density"], 6),
-                "perPage": round(r["perPage"], 6),
-            }
-        )
-    total_footprint = sum(r["footprint"] for r in coldmap_raw)
-    total_accesses = sum(r["accesses"] for r in coldmap_raw)
-
     heatmap_max = max([0, *heatmap_peak_by_file.values()])
     heatmap_rows = [
         {
@@ -1024,13 +960,8 @@ def reconstruct(
             "times": heatmap_times,
             "files": heatmap_rows,
             "values": [heatmap_values_by_file[key] for key in heatmap_files],
+            "accessed": [heatmap_accessed_by_file[key] for key in heatmap_files],
             "max": int(heatmap_max),
-        },
-        "coldmap": {
-            "files": coldmap_files,
-            "span": round(span, 6),
-            "totalFootprint": round(total_footprint, 6),
-            "totalAccesses": int(total_accesses),
         },
         "lanes": ordered_lanes,
         "timesteps": load_timesteps(conn, start_ts, end_ts),
@@ -1187,36 +1118,16 @@ canvas {
 }
 #summaryCanvas { height: 260px; }
 #heatmapCanvas { height: 520px; }
-#coldmapCanvas { height: 600px; }
+#coldmapCanvas { height: 560px; }
 #lifeCanvas { height: 620px; }
-.coldmap-controls {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px 16px;
-  align-items: center;
-  padding: 10px 13px;
-  border-bottom: 1px solid var(--line);
-  background: #fbfaf6;
-  color: var(--muted);
-  font-size: 12px;
-}
-.coldmap-controls label { display: inline-flex; align-items: center; gap: 6px; }
-.coldmap-controls select {
-  border: 1px solid var(--line);
-  background: white;
-  border-radius: 6px;
-  padding: 5px 7px;
-  font-size: 12px;
-  color: var(--ink);
-}
 .coldbar {
-  height: 12px;
-  width: 190px;
+  height: 11px;
+  width: 150px;
   border-radius: 3px;
   border: 1px solid var(--line);
-  background: linear-gradient(90deg, #1d4ed8 0%, #0e7490 32%, #ca8a04 66%, #b42318 100%);
+  background: linear-gradient(90deg, #eef4f2 0%, #7fb3aa 45%, #0f766e 78%, #06403b 100%);
   display: inline-block;
-  vertical-align: -2px;
+  vertical-align: -1px;
 }
 .legend {
   display: flex;
@@ -1289,25 +1200,11 @@ canvas {
   <section class="canvas-wrap">
     <div class="canvas-title">
       <strong>整机文件页 冷热 · 驻留热力图</strong>
-      <small id="coldmapLabel">矩形面积=驻留页时长，颜色=访问冷热；大而蓝=驻留多但很冷</small>
+      <small id="coldmapLabel">条带厚度=当前驻留页数，颜色=被访问页/驻留页占比（越浅越冷，越深越热）　冷 <span class="coldbar"></span> 热</small>
     </div>
-    <div class="coldmap-controls">
-      <label>面积
-        <select id="coldArea">
-          <option value="footprint">驻留页·秒 (page·s)</option>
-          <option value="peak">峰值页数</option>
-        </select>
-      </label>
-      <label>颜色
-        <select id="coldColor">
-          <option value="density">访问密度 (次 / page·s)</option>
-          <option value="perPage">每页访问次数</option>
-        </select>
-      </label>
-      <label><input id="coldHighlight" type="checkbox" checked> 高亮「大而冷」</label>
-      <span class="muted">冷 <span class="coldbar"></span> 热</span>
+    <div class="scroll-canvas">
+      <canvas id="coldmapCanvas"></canvas>
     </div>
-    <canvas id="coldmapCanvas"></canvas>
   </section>
   <section class="detail-controls">
     <div class="selection-pill" id="selectionPill"></div>
@@ -1335,9 +1232,6 @@ let selectedSummary = null;
 let laneLimit = 240;
 let ratioMin = 0;
 let ratioMax = 1;
-let coldArea = 'footprint';
-let coldColor = 'density';
-let coldHighlight = true;
 const palette = [
   '#0f766e','#b42318','#1d4ed8','#ca8a04','#7c3aed','#15803d','#be185d',
   '#0e7490','#9a3412','#4338ca','#4d7c0f','#a21caf','#0369a1','#c2410c',
@@ -1759,158 +1653,77 @@ function drawHeatmap() {
   document.getElementById('heatmapLabel').textContent =
     `显示 ${fmt(heatmap.files.length)} 个文件/inode；Y 轴按首次 add 时间排序；峰值 ${fmt(heatmap.max)} pages`;
 }
-function coldAreaValue(f) { return coldArea === 'peak' ? f.peak : f.footprint; }
-function coldColorValue(f) { return coldColor === 'perPage' ? f.perPage : f.density; }
-function tempColor(t) {
-  // t in [0,1]: 0 = cold (blue), 1 = hot (red). 4-stop gradient.
-  const stops = [
-    [0.00, [29, 78, 216]],   // blue
-    [0.34, [14, 116, 144]],  // teal
-    [0.68, [202, 138, 4]],   // amber
-    [1.00, [180, 35, 24]],   // red
-  ];
-  t = Math.max(0, Math.min(1, t));
-  for (let i = 1; i < stops.length; i++) {
-    if (t <= stops[i][0]) {
-      const [p0, c0] = stops[i - 1], [p1, c1] = stops[i];
-      const k = (t - p0) / Math.max(p1 - p0, 1e-9);
-      const r = Math.round(c0[0] + (c1[0] - c0[0]) * k);
-      const g = Math.round(c0[1] + (c1[1] - c0[1]) * k);
-      const b = Math.round(c0[2] + (c1[2] - c0[2]) * k);
-      return `rgb(${r},${g},${b})`;
-    }
-  }
-  return 'rgb(180,35,24)';
-}
-function squarifyWorst(row, len) {
-  const s = row.reduce((a, b) => a + b, 0);
-  const mx = Math.max(...row), mn = Math.min(...row);
-  return Math.max((len * len * mx) / (s * s), (s * s) / (len * len * mn));
-}
-function squarify(items, rect) {
-  // items: [{v, ref}] with v>0. Returns [{ref, x, y, w, h}] filling rect.
-  const out = [];
-  const sorted = items.filter(it => it.v > 0).sort((a, b) => b.v - a.v);
-  const totalV = sorted.reduce((a, b) => a + b.v, 0);
-  if (!totalV) return out;
-  const scale = (rect.w * rect.h) / totalV;
-  const areas = sorted.map(it => it.v * scale);
-  let x = rect.x, y = rect.y, w = rect.w, h = rect.h;
-  let i = 0;
-  while (i < areas.length) {
-    const horizontal = w >= h;
-    const len = horizontal ? w : h;
-    const row = [areas[i]], rowItems = [sorted[i]];
-    let j = i + 1;
-    while (j < areas.length) {
-      if (squarifyWorst(row.concat(areas[j]), len) > squarifyWorst(row, len)) break;
-      row.push(areas[j]); rowItems.push(sorted[j]); j++;
-    }
-    const s = row.reduce((a, b) => a + b, 0);
-    if (horizontal) {
-      const rowH = Math.min(h, s / Math.max(w, 1e-9));
-      let ox = x;
-      for (let k = 0; k < row.length; k++) {
-        const cw = row[k] / Math.max(rowH, 1e-9);
-        out.push({ ref: rowItems[k].ref, x: ox, y, w: cw, h: rowH });
-        ox += cw;
-      }
-      y += rowH; h -= rowH;
-    } else {
-      const rowW = Math.min(w, s / Math.max(h, 1e-9));
-      let oy = y;
-      for (let k = 0; k < row.length; k++) {
-        const ch = row[k] / Math.max(rowW, 1e-9);
-        out.push({ ref: rowItems[k].ref, x, y: oy, w: rowW, h: ch });
-        oy += ch;
-      }
-      x += rowW; w -= rowW;
-    }
-    i = j;
-  }
-  return out;
-}
-function baseName(p) {
-  const s = String(p || '');
-  const cut = s.lastIndexOf('/');
-  return cut >= 0 ? s.slice(cut + 1) : s;
+function ratioColor(ratio) {
+  // ratio in [0,1]: 0 = cold (light) -> 1 = hot (dark teal).
+  const t = Math.max(0, Math.min(1, ratio));
+  const c0 = [238, 244, 242];  // #eef4f2 near-white
+  const c1 = [6, 64, 59];      // #06403b dark teal
+  const r = Math.round(c0[0] + (c1[0] - c0[0]) * t);
+  const g = Math.round(c0[1] + (c1[1] - c0[1]) * t);
+  const b = Math.round(c0[2] + (c1[2] - c0[2]) * t);
+  return `rgb(${r},${g},${b})`;
 }
 function drawColdmap() {
   const canvas = document.getElementById('coldmapCanvas');
-  const cm = data.coldmap || {files: [], totalFootprint: 0, totalAccesses: 0};
+  const heatmap = data.heatmap || {files: [], times: [], values: [], accessed: [], max: 0};
+  const rowH = 22;
+  const pad = {l: 260, r: 18, t: 42, b: 30};
+  canvas.style.height = Math.max(320, pad.t + heatmap.files.length * rowH + pad.b) + 'px';
   const {ctx, w, h} = resizeCanvas(canvas);
+  const start = data.metadata.start;
+  const end = data.metadata.end;
+  const iw = w - pad.l - pad.r;
+  const plotBottom = h - pad.b;
+  const cellW = Math.max(1, iw / Math.max(heatmap.times.length, 1));
+  const maxPeak = Math.max(1, heatmap.max || 0);
+  window.__coldmapChart = {pad, w, h, rowH, start, end, cellW, maxPeak};
+
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, w, h);
-  const files = cm.files || [];
-  if (!files.length) {
-    ctx.fillStyle = '#66706d';
-    ctx.font = '13px "Avenir Next", sans-serif';
-    ctx.fillText('无驻留数据', 14, 26);
-    window.__coldmapTiles = [];
-    return;
-  }
-  // Log-scaled color domain over the chosen access metric (0 counts as coldest).
-  const positives = files.map(coldColorValue).filter(v => v > 0);
-  const lo = positives.length ? Math.log(Math.min(...positives)) : 0;
-  const hi = positives.length ? Math.log(Math.max(...positives)) : 1;
-  const span = Math.max(hi - lo, 1e-9);
-  const colorT = (f) => {
-    const v = coldColorValue(f);
-    if (v <= 0) return 0;
-    return (Math.log(v) - lo) / span;
-  };
-  // Thresholds for the "big & cold" highlight: top-quartile area, bottom-quartile temperature.
-  const areasSorted = files.map(coldAreaValue).slice().sort((a, b) => a - b);
-  const q = (arr, p) => arr.length ? arr[Math.min(arr.length - 1, Math.floor(p * arr.length))] : 0;
-  const areaHot = q(areasSorted, 0.75);
-  const tiles = squarify(files.map(f => ({v: Math.max(coldAreaValue(f), 0), ref: f})), {x: 0, y: 0, w, h});
-  const hit = [];
-  for (const tile of tiles) {
-    const f = tile.ref;
-    const t = colorT(f);
-    ctx.fillStyle = tempColor(t);
-    ctx.fillRect(tile.x, tile.y, Math.max(0.5, tile.w), Math.max(0.5, tile.h));
-    if (tile.w >= 1.5 && tile.h >= 1.5) {
-      ctx.strokeStyle = 'rgba(255,255,255,.55)';
-      ctx.lineWidth = 0.6;
-      ctx.strokeRect(tile.x + 0.3, tile.y + 0.3, tile.w - 0.6, tile.h - 0.6);
+  drawTimestepAxis(ctx, pad, w, plotBottom, start, end);
+  ctx.font = '11px "Avenir Next", sans-serif';
+  ctx.textBaseline = 'middle';
+
+  const maxBand = rowH - 3;
+  for (let r = 0; r < heatmap.files.length; r++) {
+    const file = heatmap.files[r];
+    const y = pad.t + r * rowH;
+    const cy = y + rowH / 2;
+    if (r % 2 === 0) {
+      ctx.fillStyle = '#fbfaf6';
+      ctx.fillRect(0, y, w, rowH);
     }
-    const big = coldAreaValue(f) >= areaHot;
-    const cold = t <= 0.25;
-    if (coldHighlight && big && cold && tile.w >= 6 && tile.h >= 6) {
-      ctx.strokeStyle = '#fffef5';
-      ctx.lineWidth = 2;
-      ctx.setLineDash([4, 3]);
-      ctx.strokeRect(tile.x + 1.5, tile.y + 1.5, tile.w - 3, tile.h - 3);
-      ctx.setLineDash([]);
+    ctx.fillStyle = '#3d4744';
+    const label = `${file.label}`;
+    ctx.fillText(label.length > 42 ? label.slice(0, 39) + '...' : label, 10, cy);
+    const resid = heatmap.values[r] || [];
+    const acc = heatmap.accessed[r] || [];
+    for (let c = 0; c < resid.length; c++) {
+      const rv = resid[c] || 0;
+      if (rv <= 0) continue;
+      const av = acc[c] || 0;
+      const ratio = Math.min(1, av / rv);
+      const th = Math.max(1, (rv / maxPeak) * maxBand);  // thickness = resident pages
+      const x = pad.l + c * cellW;
+      ctx.fillStyle = ratioColor(ratio);            // color = accessed / resident
+      ctx.fillRect(x, cy - th / 2, Math.max(1, cellW + .4), th);
     }
-    if (tile.w >= 62 && tile.h >= 26) {
-      const name = baseName(f.label);
-      ctx.fillStyle = t > 0.55 ? 'rgba(255,255,255,.96)' : 'rgba(255,255,255,.94)';
-      ctx.font = '11px "Avenir Next", sans-serif';
-      ctx.textBaseline = 'top';
-      const maxChars = Math.floor((tile.w - 10) / 6);
-      const shown = name.length > maxChars ? name.slice(0, Math.max(1, maxChars - 1)) + '…' : name;
-      ctx.fillText(shown, tile.x + 5, tile.y + 4);
-      if (tile.h >= 40) {
-        ctx.fillStyle = t > 0.55 ? 'rgba(255,255,255,.82)' : 'rgba(255,255,255,.8)';
-        ctx.fillText(fmt(f.peak) + 'p · ' + fmt(f.accesses) + ' acc', tile.x + 5, tile.y + 18);
-      }
-    }
-    hit.push({x1: tile.x, y1: tile.y, x2: tile.x + tile.w, y2: tile.y + tile.h, f, t});
   }
-  window.__coldmapTiles = hit;
-  // Summarize the cold-but-resident footprint share.
-  let coldFoot = 0, totalFoot = 0;
-  for (const f of files) {
-    totalFoot += f.footprint;
-    if (colorT(f) <= 0.25 && coldAreaValue(f) >= areaHot) coldFoot += f.footprint;
-  }
-  const pct = totalFoot > 0 ? (coldFoot * 100 / totalFoot).toFixed(1) : '0.0';
-  const areaName = coldArea === 'peak' ? '峰值页数' : '驻留页·秒';
-  document.getElementById('coldmapLabel').textContent =
-    `${fmt(files.length)} 个文件 · 面积=${areaName} · 「大而冷」文件占总驻留 ${pct}% · 虚线框=驻留多但很冷`;
+  ctx.strokeStyle = '#16211f';
+  ctx.beginPath();
+  ctx.moveTo(pad.l, pad.t);
+  ctx.lineTo(pad.l, plotBottom);
+  ctx.lineTo(w - pad.r, plotBottom);
+  ctx.stroke();
+  ctx.fillStyle = '#66706d';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(timeFmt(start), pad.l, h - 9);
+  ctx.textAlign = 'right';
+  ctx.fillText(timeFmt(end), w - pad.r, h - 9);
+  ctx.textAlign = 'left';
+  document.getElementById('coldmapLabel').innerHTML =
+    `条带厚度=当前驻留页数（全局最大 ${fmt(maxPeak)} 页），颜色=被访问页/驻留页占比（越浅越冷，越深越热）　冷 <span class="coldbar"></span> 热`;
 }
 function drawLegend() {
   const groups = groupList().slice(0, 28);
@@ -1935,24 +1748,34 @@ document.getElementById('modePid').onclick = () => {
 document.getElementById('modeFilePid').onclick = () => {
   setMode('filePid');
 };
-document.getElementById('coldArea').onchange = (e) => { coldArea = e.target.value; drawColdmap(); };
-document.getElementById('coldColor').onchange = (e) => { coldColor = e.target.value; drawColdmap(); };
-document.getElementById('coldHighlight').onchange = (e) => { coldHighlight = e.target.checked; drawColdmap(); };
 document.getElementById('coldmapCanvas').addEventListener('mousemove', (e) => {
   const tip = document.getElementById('tip');
+  const heatmap = data.heatmap || {files: [], times: [], values: [], accessed: []};
+  const chart = window.__coldmapChart;
+  if (!chart || !heatmap.files.length || !heatmap.times.length) { tip.style.display = 'none'; return; }
   const rect = e.currentTarget.getBoundingClientRect();
   const x = e.clientX - rect.left, y = e.clientY - rect.top;
-  const hit = (window.__coldmapTiles || []).find(s => x >= s.x1 && x <= s.x2 && y >= s.y1 && y <= s.y2);
-  if (!hit) { tip.style.display = 'none'; return; }
-  const f = hit.f;
-  const heat = hit.t <= 0.25 ? '冷' : (hit.t >= 0.62 ? '热' : '温');
-  tip.innerHTML = `<b>${escapeHtml(f.label)}</b><br>` +
-    `<span class="muted">${escapeHtml(f.dev)} · ${escapeHtml(f.ino)}</span><br>` +
-    `驻留: 峰值 <b>${fmt(f.peak)}</b> 页 · 均值 ${fmt(f.meanPages)} 页 · footprint ${fmt(f.footprint)} page·s<br>` +
-    `访问: <b>${fmt(f.accesses)}</b> 次 · 加载 ${fmt(f.adds)} 页<br>` +
-    `冷热(${escapeHtml(heat)}): 密度 ${f.density.toFixed(4)} 次/page·s · 每页 ${f.perPage.toFixed(3)} 次`;
+  const {pad, rowH, cellW} = chart;
+  if (x < pad.l || x > rect.width - pad.r || y < pad.t || y > rect.height - pad.b) {
+    tip.style.display = 'none';
+    return;
+  }
+  const rowIndex = Math.floor((y - pad.t) / rowH);
+  const colIndex = Math.max(0, Math.min(heatmap.times.length - 1, Math.floor((x - pad.l) / Math.max(cellW, 1))));
+  const file = heatmap.files[rowIndex];
+  if (!file) { tip.style.display = 'none'; return; }
+  const rv = (heatmap.values[rowIndex] || [])[colIndex] || 0;
+  const av = (heatmap.accessed[rowIndex] || [])[colIndex] || 0;
+  const ratio = rv > 0 ? Math.min(1, av / rv) : 0;
+  const t = heatmap.times[colIndex];
+  const step = nearestStep(t);
+  const heat = ratio <= 0.15 ? '冷' : (ratio >= 0.5 ? '热' : '温');
+  tip.innerHTML = `<b>${escapeHtml(file.label)}</b><br>` +
+    `<span class="muted">${escapeHtml(file.dev)} · ${escapeHtml(file.ino)}</span><br>` +
+    `<span class="muted">${timeFmt(t)}${step ? ' · 业务步骤: ' + escapeHtml(step.step) : ''}</span><br>` +
+    `驻留页: <b>${fmt(rv)}</b> · 被访问页: <b>${fmt(av)}</b> · 冷热(${escapeHtml(heat)}): <b>${(ratio * 100).toFixed(1)}%</b>`;
   tip.style.left = Math.min(window.innerWidth - 540, e.clientX + 14) + 'px';
-  tip.style.top = Math.min(window.innerHeight - 140, e.clientY + 14) + 'px';
+  tip.style.top = Math.min(window.innerHeight - 130, e.clientY + 14) + 'px';
   tip.style.display = 'block';
 });
 document.getElementById('coldmapCanvas').addEventListener('mouseleave', () => {
@@ -2113,12 +1936,6 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         type=int,
         default=260,
         help="Number of files/inodes to retain for the residency heatmap.",
-    )
-    parser.add_argument(
-        "--max-coldmap-files",
-        type=int,
-        default=400,
-        help="Number of top-footprint files to retain for the whole-machine cold/hot treemap.",
     )
     parser.add_argument(
         "--max-lane-events",

@@ -52,13 +52,13 @@ The core model: a page is identified by `(dev, ino, ofs)`. Events drive a state 
 - `mm_filemap_delete_from_page_cache` → closes it.
 - `mm_filemap_access_history` → does **not** change residency, but reassigns the interval's current owning `pid_name` (this is what powers the "color by pid_name" mode vs. "color by file" mode).
 
-`main()` (`fscache_residency.py:1694`) runs **two passes over the event stream** (events are merged from the add/delete/access tables, ordered by timestamp, via `iter_events`):
+`main()` runs **two passes over the event stream** (events are merged from the add/delete/access tables, ordered by timestamp, via `iter_events`):
 - **Pass 1 — `pass_for_peaks`**: finds peak-residency moments and selects the top-N files, `pid_name`s, and file+pid groups to color, plus heatmap files.
 - **Pass 2 — `reconstruct`**: rebuilds the aggregate residency curve, per-page lifecycle lanes, and the heatmap, keyed to the groups chosen in pass 1.
 
-Pass 2 also computes the **whole-machine cold/hot treemap** (`coldmap` payload): per-file `footprint` (resident page-seconds = ∫ resident-page-count dt, integrated incrementally via `flush_file`), `peak` pages, access count, and `density` (accesses per page-second). The viewer renders it as a squarified treemap where **area = residency footprint** and **color = access density** (blue=cold → red=hot), so files that hold a lot of cache but are rarely accessed show up as large blue tiles (dashed-outlined when in the top-quartile-area / bottom-quartile-temperature "big & cold" set).
+Pass 2 also computes the **whole-machine cold/hot heatmap**, carried in the `heatmap` payload alongside the residency values. For each retained inode and time bucket it records `values` (resident pages, the existing residency heatmap) and `accessed` (distinct resident pages of that inode that got an access within the bucket, tracked via per-bucket `bucket_accessed` sets, capped at the resident count). The viewer renders it as a second time×inode heatmap where each inode's band **thickness = resident pages** (scaled by the global peak) and **color = accessed/resident ratio** (light = cold → dark teal = hot), so inodes holding many resident pages that are rarely accessed show up as thick pale bands.
 
-The result dict feeds `write_outputs`, which substitutes it into `HTML_TEMPLATE` (a big raw-string near line 820) at the `__DATA__` placeholder. **The viewer is one Python string containing HTML+CSS+JS** — edit the template in place; there is no separate front-end build.
+The result dict feeds `write_outputs`, which substitutes it into `HTML_TEMPLATE` (a big raw-string, `HTML_TEMPLATE = r"""..."""`) at the `__DATA__` placeholder. **The viewer is one Python string containing HTML+CSS+JS** — edit the template in place; there is no separate front-end build.
 
 **Anomaly counters** (`delete_without_active_add`, `access_without_active_add`, `duplicate_add_closed_previous`) are tallied during reconstruction and surfaced in the output; nonzero values usually mean the trace window is truncated or events were dropped, not a code bug.
 
