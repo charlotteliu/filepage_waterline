@@ -36,6 +36,14 @@ There are no tests, linters, or build config. `python3` is the only runtime (rep
 - `--no-access` — reconstruct residency from add/delete only; skip `access` events (which reassign a page's owning `pid_name`).
 - `--max-lanes` / `--max-heatmap-files` / `--max-groups` / `--max-coldmap-files` — cap how much detail survives into each chart.
 - `--bucket-seconds` / `--target-points` — aggregate-curve resolution (auto-targets ~260 points).
+- `--build-indices` — create missing `timestamp` indexes on the event tables (one-time write to the DB). **Run this once on large DBs.**
+
+### Performance model (matters for multi-GB DBs / tens of millions of events)
+The visualizer streams the merged add/delete/access log in timestamp order, twice (peaks pass + reconstruct pass). How that stream is produced depends on indexes:
+- **With a `timestamp`-leading index on each event table** (`has_all_timestamp_indexes`): `iter_events` runs one index-ordered cursor per table and merges them with `heapq.merge` — no sort, bounded memory, `SCAN ... USING INDEX`.
+- **Without** those indexes: it falls back to a single `UNION ALL ... ORDER BY timestamp`, which makes SQLite build a temp b-tree (`USE TEMP B-TREE FOR ORDER BY`) over *every* event. `connect()` sets `temp_store=FILE` so this spills to disk instead of OOMing, but it is slow — the visualizer prints a WARNING recommending `--build-indices`.
+
+The ingest script (`load_ftrace_to_db_file.py`) does **not** create these indexes (its `build_indices` is commented out), so freshly-built real DBs need `--build-indices` once. Other perf-relevant choices: `--file-like` is resolved to a set of `dev|ino` keys up front (Python membership test, not a per-row SQL `EXISTS`); per-resident-page state is a 5-element list, not a dict, to bound memory when millions of pages are resident at once.
 
 ## Architecture of the visualizer
 

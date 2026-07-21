@@ -15,6 +15,8 @@ resident pages keyed by (dev, ino, ofs), and writes a standalone HTML viewer.
 
 import argparse
 import collections
+import heapq
+import itertools
 import json
 import math
 import os
@@ -36,14 +38,61 @@ PageKey = Tuple[str, str, int]
 FileKey = Tuple[str, str]
 
 
-def connect(db_path: str) -> sqlite3.Connection:
+def connect(db_path: str, writable: bool = False) -> sqlite3.Connection:
     if not os.path.exists(db_path):
         raise SystemExit(f"DB not found: {db_path}")
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    mode = "rw" if writable else "ro"
+    conn = sqlite3.connect(f"file:{db_path}?mode={mode}", uri=True)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only = ON")
-    conn.execute("PRAGMA temp_store = MEMORY")
+    if not writable:
+        conn.execute("PRAGMA query_only = ON")
+    # Spill big sorts/temp b-trees to disk instead of RAM (a UNION-ALL sort over
+    # tens of millions of rows would otherwise OOM). Give the reader a large page
+    # cache and memory-mapped I/O for sequential scans over a multi-GB DB.
+    conn.execute("PRAGMA temp_store = FILE")
+    conn.execute("PRAGMA cache_size = -1048576")  # ~1 GiB page cache
+    try:
+        conn.execute("PRAGMA mmap_size = 17179869184")  # up to 16 GiB mmap
+    except sqlite3.OperationalError:
+        pass
     return conn
+
+
+# Streaming the merged event log in timestamp order is only cheap when each
+# source table has an index that starts with `timestamp`; otherwise SQLite must
+# sort. These helpers detect / create those indexes.
+TS_INDEX_TABLES = (ADD_TABLE, DELETE_TABLE, ACCESS_TABLE)
+
+
+def has_timestamp_index(conn: sqlite3.Connection, table: str) -> bool:
+    if not table_exists(conn, table):
+        return False
+    for idx in conn.execute(f"PRAGMA index_list({table})").fetchall():
+        cols = conn.execute(f"PRAGMA index_info({idx['name']})").fetchall()
+        if cols and cols[0]["name"] == "timestamp":
+            return True
+    return False
+
+
+def has_all_timestamp_indexes(conn: sqlite3.Connection, include_access: bool) -> bool:
+    tables = [ADD_TABLE, DELETE_TABLE] + ([ACCESS_TABLE] if include_access else [])
+    return all(has_timestamp_index(conn, t) for t in tables)
+
+
+def build_timestamp_indexes(db_path: str, include_access: bool) -> None:
+    tables = [ADD_TABLE, DELETE_TABLE] + ([ACCESS_TABLE] if include_access else [])
+    wconn = connect(db_path, writable=True)
+    try:
+        for table in tables:
+            if not table_exists(wconn, table) or has_timestamp_index(wconn, table):
+                continue
+            print(f"Building timestamp index on {table} (one-time)...", file=sys.stderr)
+            wconn.execute(
+                f"CREATE INDEX IF NOT EXISTS ix_{table}_ts ON {table}(timestamp)"
+            )
+        wconn.commit()
+    finally:
+        wconn.close()
 
 
 def table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -161,6 +210,68 @@ def event_query(
     return sql, params
 
 
+def resolve_file_keys(conn: sqlite3.Connection, file_like: str) -> Optional[set]:
+    """Resolve a filename LIKE filter to a set of dev|ino file keys, so the hot
+    loop can filter with a Python set lookup instead of a per-row EXISTS query."""
+    if not table_exists(conn, INODE_TABLE):
+        return None
+    keys = set()
+    for row in conn.execute(
+        f"SELECT dev, ino FROM {INODE_TABLE} WHERE filename LIKE ?", (file_like,)
+    ):
+        keys.add(make_file_key(str(row["dev"]), str(row["ino"])))
+    return keys
+
+
+def _table_stream(
+    conn: sqlite3.Connection,
+    table: str,
+    kind: str,
+    sort_order: int,
+    start: Optional[float],
+    end: Optional[float],
+    pid_like: Optional[str],
+) -> Iterable[Event]:
+    """Timestamp-ordered event stream for one table, using its timestamp index
+    so SQLite returns rows already sorted (no temp b-tree)."""
+    clauses: List[str] = []
+    params: List[object] = []
+    if start is not None:
+        clauses.append("t.timestamp >= ?")
+        params.append(start)
+    if end is not None:
+        clauses.append("t.timestamp <= ?")
+        params.append(end)
+    if pid_like:
+        clauses.append("t.pid_name LIKE ?")
+        params.append(pid_like)
+    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = (
+        "SELECT t.timestamp AS timestamp, t.dev AS dev, t.ino AS ino, "
+        "t.ofs AS ofs, COALESCE(t.pid_name, '') AS pid_name "
+        f"FROM {table} t {where_sql} ORDER BY t.timestamp"
+    )
+    cur = conn.execute(sql, params)
+    while True:
+        rows = cur.fetchmany(50000)
+        if not rows:
+            break
+        for row in rows:
+            try:
+                ofs = int(row["ofs"])
+            except (TypeError, ValueError):
+                continue
+            yield (
+                float(row["timestamp"]),
+                sort_order,
+                kind,
+                str(row["dev"]),
+                str(row["ino"]),
+                ofs,
+                str(row["pid_name"] or "unknown"),
+            )
+
+
 def iter_events(
     conn: sqlite3.Connection,
     include_access: bool,
@@ -170,6 +281,32 @@ def iter_events(
     file_like: Optional[str],
     event_limit: Optional[int],
 ) -> Iterable[Event]:
+    # Fast path: merge per-table timestamp-ordered cursors with heapq.merge.
+    # Streams lazily with bounded memory and no global sort. file_like is applied
+    # as a Python set membership test rather than a correlated SQL subquery.
+    if has_all_timestamp_indexes(conn, include_access):
+        allowed_files: Optional[set] = None
+        if file_like:
+            allowed_files = resolve_file_keys(conn, file_like)
+            if not allowed_files:
+                return
+        specs = [(ADD_TABLE, "add", 0), (DELETE_TABLE, "delete", 2)]
+        if include_access:
+            specs.append((ACCESS_TABLE, "access", 1))
+        streams = [
+            _table_stream(conn, table, kind, order, start, end, pid_like)
+            for table, kind, order in specs
+        ]
+        merged = heapq.merge(*streams, key=lambda e: (e[0], e[1]))
+        if allowed_files is not None:
+            merged = (e for e in merged if make_file_key(e[3], e[4]) in allowed_files)
+        if event_limit is not None:
+            merged = itertools.islice(merged, event_limit)
+        yield from merged
+        return
+
+    # Fallback: single UNION-ALL query with an ORDER BY sort (works without any
+    # index, but slower and memory-heavy — prefer --build-indices).
     sql, params = event_query(
         conn, include_access, start, end, pid_like, file_like, event_limit
     )
@@ -216,23 +353,25 @@ def min_max_timestamp(
             raise SystemExit("No matching add/delete/access events found.")
         return first, last
 
-    selects: List[str] = []
-    params: List[object] = []
+    # Per-table MIN/MAX: with a timestamp index these are O(1) endpoint lookups.
+    # Avoids materializing a UNION over every event just to find the range.
+    mins: List[float] = []
+    maxs: List[float] = []
     for table in [ADD_TABLE, DELETE_TABLE] + ([ACCESS_TABLE] if include_access else []):
         where_sql, where_params = build_table_filter(
             "t", start, end, pid_like, file_like
         )
-        selects.append(f"SELECT t.timestamp AS timestamp FROM {table} t {where_sql}")
-        params.extend(where_params)
-    row = conn.execute(
-        "SELECT MIN(timestamp) AS min_ts, MAX(timestamp) AS max_ts FROM ("
-        + "\nUNION ALL\n".join(selects)
-        + ")",
-        params,
-    ).fetchone()
-    if row is None or row["min_ts"] is None or row["max_ts"] is None:
+        row = conn.execute(
+            f"SELECT MIN(t.timestamp) AS min_ts, MAX(t.timestamp) AS max_ts "
+            f"FROM {table} t {where_sql}",
+            where_params,
+        ).fetchone()
+        if row is not None and row["min_ts"] is not None:
+            mins.append(float(row["min_ts"]))
+            maxs.append(float(row["max_ts"]))
+    if not mins:
         raise SystemExit("No matching add/delete/access events found.")
-    return float(row["min_ts"]), float(row["max_ts"])
+    return min(mins), max(maxs)
 
 
 def file_label(file_key: FileKey, mapping: Dict[FileKey, Dict[str, object]]) -> str:
@@ -558,7 +697,11 @@ def reconstruct(
     heatmap_files: Sequence[str],
     candidate_pages: Sequence[PageKey],
 ) -> Dict[str, object]:
-    active: Dict[PageKey, Dict[str, object]] = {}
+    # Per-resident-page state is stored as a small list rather than a dict to
+    # keep memory bounded when millions of pages are resident at once.
+    # Fields: [fileKey, pidName, segmentStart, segmentAccessCount, segmentFirstAccess]
+    S_FILE, S_PID, S_SEGSTART, S_SEGACC, S_SEGFIRST = 0, 1, 2, 3, 4
+    active: Dict[PageKey, list] = {}
     by_file: collections.Counter = collections.Counter()
     by_pid: collections.Counter = collections.Counter()
     by_file_pid: collections.Counter = collections.Counter()
@@ -660,37 +803,38 @@ def reconstruct(
     def close_lane_segment(page_key: PageKey, ts: float, reason: str) -> None:
         lane = ensure_lane(page_key)
         state = active.get(page_key)
-        if lane is None or state is None or state.get("segmentStart") is None:
+        if lane is None or state is None or state[S_SEGSTART] is None:
             return
-        start = float(state["segmentStart"])
+        start = float(state[S_SEGSTART])
         if ts < start:
             ts = start
+        first_access = state[S_SEGFIRST]
         lane["segments"].append(
             {
                 "start": round(start, 6),
                 "end": round(ts, 6),
-                "fileKey": state["fileKey"],
-                "pidName": state["pidName"],
+                "fileKey": state[S_FILE],
+                "pidName": state[S_PID],
                 "reason": reason,
-                "accessCount": int(state.get("segmentAccessCount", 0)),
-                "firstAccess": round(float(state["segmentFirstAccess"]), 6)
-                if state.get("segmentFirstAccess") is not None
+                "accessCount": int(state[S_SEGACC]),
+                "firstAccess": round(float(first_access), 6)
+                if first_access is not None
                 else None,
-                "accessDelay": round(float(state["segmentFirstAccess"]) - start, 6)
-                if state.get("segmentFirstAccess") is not None
+                "accessDelay": round(float(first_access) - start, 6)
+                if first_access is not None
                 else None,
                 "residentDuration": round(max(0.0, ts - start), 6),
                 "accessDelayRatio": round(
-                    max(0.0, min(1.0, (float(state["segmentFirstAccess"]) - start) / max(ts - start, 1e-9))),
+                    max(0.0, min(1.0, (float(first_access) - start) / max(ts - start, 1e-9))),
                     6,
                 )
-                if state.get("segmentFirstAccess") is not None
+                if first_access is not None
                 else None,
             }
         )
-        state["segmentStart"] = ts
-        state["segmentAccessCount"] = 0
-        state["segmentFirstAccess"] = None
+        state[S_SEGSTART] = ts
+        state[S_SEGACC] = 0
+        state[S_SEGFIRST] = None
 
     for ts, _sort, kind, dev, ino, ofs, pid_name in iter_events(
         conn,
@@ -714,19 +858,12 @@ def reconstruct(
             if page_key in active:
                 close_lane_segment(page_key, ts, "duplicate_add")
                 old = active[page_key]
-                flush_file(old["fileKey"], ts)
-                by_file[old["fileKey"]] -= 1
-                by_pid[old["pidName"]] -= 1
-                by_file_pid[make_file_pid_key(old["fileKey"], old["pidName"])] -= 1
+                flush_file(old[S_FILE], ts)
+                by_file[old[S_FILE]] -= 1
+                by_pid[old[S_PID]] -= 1
+                by_file_pid[make_file_pid_key(old[S_FILE], old[S_PID])] -= 1
                 anomalies["duplicate_add_closed_previous"] += 1
-            active[page_key] = {
-                "fileKey": file_key,
-                "pidName": pid,
-                "start": ts,
-                "segmentStart": ts,
-                "segmentAccessCount": 0,
-                "segmentFirstAccess": None,
-            }
+            active[page_key] = [file_key, pid, ts, 0, None]
             flush_file(file_key, ts)
             by_file[file_key] += 1
             if by_file[file_key] > file_peak[file_key]:
@@ -742,10 +879,10 @@ def reconstruct(
                 anomalies["delete_without_active_add"] += 1
             else:
                 close_lane_segment(page_key, ts, "delete")
-                flush_file(state["fileKey"], ts)
-                by_file[state["fileKey"]] -= 1
-                by_pid[state["pidName"]] -= 1
-                by_file_pid[make_file_pid_key(state["fileKey"], state["pidName"])] -= 1
+                flush_file(state[S_FILE], ts)
+                by_file[state[S_FILE]] -= 1
+                by_pid[state[S_PID]] -= 1
+                by_file_pid[make_file_pid_key(state[S_FILE], state[S_PID])] -= 1
                 active.pop(page_key, None)
         elif kind == "access":
             state = active.get(page_key)
@@ -753,18 +890,18 @@ def reconstruct(
             if state is None:
                 anomalies["access_without_active_add"] += 1
             else:
-                file_acc[state["fileKey"]] += 1
-                if state.get("segmentFirstAccess") is None:
-                    state["segmentFirstAccess"] = ts
-                state["segmentAccessCount"] = int(state.get("segmentAccessCount", 0)) + 1
-                if pid != state["pidName"]:
+                file_acc[state[S_FILE]] += 1
+                if state[S_SEGFIRST] is None:
+                    state[S_SEGFIRST] = ts
+                state[S_SEGACC] += 1
+                if pid != state[S_PID]:
                     close_lane_segment(page_key, ts, "pid_change")
-                    by_pid[state["pidName"]] -= 1
+                    by_pid[state[S_PID]] -= 1
                     by_pid[pid] += 1
-                    by_file_pid[make_file_pid_key(state["fileKey"], state["pidName"])] -= 1
-                    by_file_pid[make_file_pid_key(state["fileKey"], pid)] += 1
-                    state["pidName"] = pid
-                    state["segmentStart"] = ts
+                    by_file_pid[make_file_pid_key(state[S_FILE], state[S_PID])] -= 1
+                    by_file_pid[make_file_pid_key(state[S_FILE], pid)] += 1
+                    state[S_PID] = pid
+                    state[S_SEGSTART] = ts
 
     while next_bucket <= end_ts + 1e-9:
         emit_snapshot(next_bucket)
@@ -2009,15 +2146,31 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Ignore access events. Add/delete still reconstruct residency.",
     )
     parser.set_defaults(include_access=True)
+    parser.add_argument(
+        "--build-indices",
+        action="store_true",
+        help="Create missing timestamp indexes on the event tables (writes to the "
+        "DB, one-time). Strongly recommended for large DBs — enables the streaming "
+        "merge fast path and avoids a full in-memory sort of every event.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
+    if args.build_indices:
+        build_timestamp_indexes(args.db, args.include_access)
     conn = connect(args.db)
     require_tables(conn, args.include_access)
     if args.file_like and not table_exists(conn, INODE_TABLE):
         raise SystemExit("--file-like requires inode_mapping table.")
+    if not has_all_timestamp_indexes(conn, args.include_access):
+        print(
+            "WARNING: event tables lack a timestamp index; falling back to a full "
+            "sort of every event (slow, memory-heavy). Re-run with --build-indices "
+            "once to enable the streaming fast path.",
+            file=sys.stderr,
+        )
 
     print("Loading inode mapping...", file=sys.stderr)
     mapping = load_inode_mapping(conn)
