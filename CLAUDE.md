@@ -8,8 +8,9 @@ Reconstruct and visualize Linux **file page-cache residency lifecycles** from ft
 
 1. **Ingest** (`load_ftrace_to_db_file.py`, repo root): parses raw ftrace text logs (plus `smaps`, `inode.txt`, ark disassembly, step-info) into a SQLite DB via regexes, one table per event type.
 2. **Visualize** (`outputs/fscache_residency.py`): reads that DB read-only, reconstructs residency intervals, and emits a **standalone self-contained HTML viewer** (vanilla JS + `<canvas>`, no external/CDN dependencies — data is embedded as inline JSON).
+3. **Analyze** (`outputs/cold_page_stats.py`): non-visual stats tool. Streams add/delete/access(+`label`>1) events in timestamp order, reconstructs each `(dev,ino,ofs)` add→delete interval, flags **cold pages** (≤1 access), and reports cold **spacetime** (page-seconds; 0-access = delete−add, 1-access = delete−access) and average cold footprint (spacetime ÷ test window). Same streaming/index/pragma performance model as the visualizer; `--build-indices`, `--no-label-access`, `--top`, `--json`, `--csv`.
 
-The two halves are decoupled by the SQLite schema. Most work happens in the visualizer; the ingest script depends on data paths and a `script/` package that are **not checked into this repo**.
+The halves are decoupled by the SQLite schema. Most work happens in the visualizer; the ingest script depends on data paths and a `script/` package that are **not checked into this repo**. `devlog/` holds dated development-log entries describing feature goals/plans and what was implemented.
 
 ## Commands
 
