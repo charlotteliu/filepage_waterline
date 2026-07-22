@@ -223,6 +223,36 @@ def resolve_file_keys(conn: sqlite3.Connection, file_like: str) -> Optional[set]
     return keys
 
 
+def glob_to_like(pattern: str) -> str:
+    """Translate a shell-style glob (``*``/``?``) to a SQL LIKE pattern."""
+    out: List[str] = []
+    for ch in pattern:
+        if ch == "*":
+            out.append("%")
+        elif ch == "?":
+            out.append("_")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def resolve_excluded_file_keys(
+    conn: sqlite3.Connection, patterns: Optional[Sequence[str]]
+) -> set:
+    """Resolve --exclude-file glob patterns to a set of dev|ino keys whose
+    inode_mapping.filename matches any pattern; those inodes are dropped."""
+    if not patterns or not table_exists(conn, INODE_TABLE):
+        return set()
+    keys: set = set()
+    for pat in patterns:
+        like = glob_to_like(pat)
+        for row in conn.execute(
+            f"SELECT dev, ino FROM {INODE_TABLE} WHERE filename LIKE ?", (like,)
+        ):
+            keys.add(make_file_key(str(row["dev"]), str(row["ino"])))
+    return keys
+
+
 def _table_stream(
     conn: sqlite3.Connection,
     table: str,
@@ -280,6 +310,7 @@ def iter_events(
     pid_like: Optional[str],
     file_like: Optional[str],
     event_limit: Optional[int],
+    exclude_files: Optional[set] = None,
 ) -> Iterable[Event]:
     # Fast path: merge per-table timestamp-ordered cursors with heapq.merge.
     # Streams lazily with bounded memory and no global sort. file_like is applied
@@ -300,6 +331,8 @@ def iter_events(
         merged = heapq.merge(*streams, key=lambda e: (e[0], e[1]))
         if allowed_files is not None:
             merged = (e for e in merged if make_file_key(e[3], e[4]) in allowed_files)
+        if exclude_files:
+            merged = (e for e in merged if make_file_key(e[3], e[4]) not in exclude_files)
         if event_limit is not None:
             merged = itertools.islice(merged, event_limit)
         yield from merged
@@ -320,12 +353,16 @@ def iter_events(
                 ofs = int(row["ofs"])
             except (TypeError, ValueError):
                 continue
+            dev = str(row["dev"])
+            ino = str(row["ino"])
+            if exclude_files and make_file_key(dev, ino) in exclude_files:
+                continue
             yield (
                 float(row["timestamp"]),
                 int(row["sort_order"]),
                 str(row["kind"]),
-                str(row["dev"]),
-                str(row["ino"]),
+                dev,
+                ino,
                 ofs,
                 str(row["pid_name"] or "unknown"),
             )
@@ -339,11 +376,13 @@ def min_max_timestamp(
     pid_like: Optional[str],
     file_like: Optional[str],
     event_limit: Optional[int],
+    exclude_files: Optional[set] = None,
 ) -> Tuple[float, float]:
     if event_limit is not None:
         first = last = None
         for event in iter_events(
-            conn, include_access, start, end, pid_like, file_like, event_limit
+            conn, include_access, start, end, pid_like, file_like, event_limit,
+            exclude_files,
         ):
             ts = event[0]
             if first is None:
@@ -416,6 +455,7 @@ def load_candidate_pages(
     top_files: Optional[Sequence[str]] = None,
     top_pids: Optional[Sequence[str]] = None,
     top_file_pids: Optional[Sequence[str]] = None,
+    exclude_files: Optional[set] = None,
 ) -> List[PageKey]:
     if max_lanes <= 0:
         return []
@@ -425,7 +465,10 @@ def load_candidate_pages(
 
     def add_rows(rows: Sequence[sqlite3.Row]) -> None:
         for r in rows:
-            key = (str(r["dev"]), str(r["ino"]), int(r["ofs"]))
+            dev, ino = str(r["dev"]), str(r["ino"])
+            if exclude_files and make_file_key(dev, ino) in exclude_files:
+                continue
+            key = (dev, ino, int(r["ofs"]))
             if key in seen:
                 continue
             seen.add(key)
@@ -623,6 +666,7 @@ def pass_for_peaks(
         args.pid_like,
         args.file_like,
         args.event_limit,
+        getattr(args, "exclude_keys", None),
     ):
         while next_bucket <= ts:
             snapshot_peaks()
@@ -835,6 +879,7 @@ def reconstruct(
         args.pid_like,
         args.file_like,
         args.event_limit,
+        getattr(args, "exclude_keys", None),
     ):
         while next_bucket <= ts:
             emit_snapshot(next_bucket)
@@ -2046,6 +2091,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Optional SQL LIKE filter for inode_mapping.filename, for example '%%/data/%%'.",
     )
     parser.add_argument(
+        "--exclude-file",
+        action="append",
+        metavar="GLOB",
+        help="Drop inodes whose filename matches this glob (* and ? wildcards), "
+        "for example '/data/log/*'. Repeatable to exclude several patterns.",
+    )
+    parser.add_argument(
         "--event-limit",
         type=int,
         help="Debug/testing limit after timestamp ordering.",
@@ -2075,6 +2127,15 @@ def main(argv: Sequence[str]) -> int:
     require_tables(conn, args.include_access)
     if args.file_like and not table_exists(conn, INODE_TABLE):
         raise SystemExit("--file-like requires inode_mapping table.")
+    if args.exclude_file and not table_exists(conn, INODE_TABLE):
+        raise SystemExit("--exclude-file requires inode_mapping table.")
+    args.exclude_keys = resolve_excluded_file_keys(conn, args.exclude_file)
+    if args.exclude_file:
+        print(
+            f"Excluding {len(args.exclude_keys)} inode(s) matching "
+            f"{args.exclude_file}",
+            file=sys.stderr,
+        )
     if not has_all_timestamp_indexes(conn, args.include_access):
         print(
             "WARNING: event tables lack a timestamp index; falling back to a full "
@@ -2095,6 +2156,7 @@ def main(argv: Sequence[str]) -> int:
         args.pid_like,
         args.file_like,
         args.event_limit,
+        args.exclude_keys,
     )
     bucket_seconds = choose_bucket_seconds(
         start_ts, end_ts, args.bucket_seconds, args.target_points
@@ -2126,6 +2188,7 @@ def main(argv: Sequence[str]) -> int:
         top_files,
         top_pids,
         top_file_pids,
+        args.exclude_keys,
     )
 
     print("Pass 2/2: reconstructing series and page lifecycles...", file=sys.stderr)

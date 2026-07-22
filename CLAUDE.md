@@ -32,7 +32,8 @@ There are no tests, linters, or build config. `python3` is the only runtime (rep
 
 ### Key `fscache_residency.py` flags
 - `--start/--end` — timestamp window (seconds).
-- `--file-like` / `--pid-like` — SQL `LIKE` filters on `inode_mapping.filename` / `pid_name`.
+- `--file-like` / `--pid-like` — SQL `LIKE` include-filters on `inode_mapping.filename` / `pid_name`.
+- `--exclude-file GLOB` — drop inodes whose `inode_mapping.filename` matches a glob (`*`/`?`), e.g. `--exclude-file /data/log/*`. Repeatable. Resolved once to a set of `dev|ino` keys (`resolve_excluded_file_keys`) and applied as a Python membership test in `iter_events`/`load_candidate_pages`; stashed on `args.exclude_keys`.
 - `--no-access` — reconstruct residency from add/delete only; skip `access` events (which reassign a page's owning `pid_name`).
 - `--max-lanes` / `--max-heatmap-files` / `--max-groups` / `--max-coldmap-files` — cap how much detail survives into each chart.
 - `--bucket-seconds` / `--target-points` — aggregate-curve resolution (auto-targets ~260 points).
