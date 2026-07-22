@@ -19,6 +19,11 @@ number of cold pages (and bytes) resident across the whole test window.
 
 Only closed add->delete intervals are counted (a delete is required). Pages
 still resident at the end of the window are reported separately, not counted.
+
+--exclude-file GLOB drops inodes whose inode_mapping.filename matches a shell
+glob (e.g. '/data/log/*'); repeatable. Resolved once to a set of dev|ino keys
+(resolve_excluded_file_keys) and applied as a Python membership test in
+iter_events.
 """
 
 import argparse
@@ -73,6 +78,36 @@ def has_timestamp_index(conn: sqlite3.Connection, table: str) -> bool:
         if cols and cols[0]["name"] == "timestamp":
             return True
     return False
+
+
+def glob_to_like(pattern: str) -> str:
+    """Translate a shell-style glob (``*``/``?``) to a SQL LIKE pattern."""
+    out: List[str] = []
+    for ch in pattern:
+        if ch == "*":
+            out.append("%")
+        elif ch == "?":
+            out.append("_")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def resolve_excluded_file_keys(
+    conn: sqlite3.Connection, patterns: Optional[Sequence[str]]
+) -> set:
+    """Resolve --exclude-file glob patterns to a set of dev|ino keys whose
+    inode_mapping.filename matches any pattern; those inodes are dropped."""
+    if not patterns or not table_exists(conn, INODE_TABLE):
+        return set()
+    keys: set = set()
+    for pat in patterns:
+        like = glob_to_like(pat)
+        for row in conn.execute(
+            f"SELECT dev, ino FROM {INODE_TABLE} WHERE filename LIKE ?", (like,)
+        ):
+            keys.add(make_file_key(str(row["dev"]), str(row["ino"])))
+    return keys
 
 
 def make_file_key(dev: str, ino: str) -> str:
@@ -159,12 +194,14 @@ def iter_events(
     end: Optional[float],
     use_label: bool,
     label_gt: int,
+    exclude_files: Optional[set] = None,
 ) -> Iterable[Event]:
     """Merge add/delete/access(+label>N) events in timestamp order.
 
     Uses per-table timestamp-index cursors + heapq.merge when every source
     table has a timestamp index (no sort); otherwise falls back to a single
-    UNION ALL ... ORDER BY (a temp b-tree sort)."""
+    UNION ALL ... ORDER BY (a temp b-tree sort). Events whose (dev, ino) is in
+    ``exclude_files`` are dropped (Python membership test)."""
     have_access = table_exists(conn, ACCESS_TABLE)
     have_label = use_label and table_exists(conn, LABEL_TABLE)
     tables = used_tables(conn, use_label)
@@ -180,7 +217,10 @@ def iter_events(
             _stream(conn, table, kind, order, start, end, lmin)
             for table, kind, order, lmin in specs
         ]
-        yield from heapq.merge(*streams, key=lambda e: (e[0], e[1]))
+        merged = heapq.merge(*streams, key=lambda e: (e[0], e[1]))
+        if exclude_files:
+            merged = (e for e in merged if make_file_key(e[3], e[4]) not in exclude_files)
+        yield from merged
         return
 
     # Fallback: UNION ALL with a global sort.
@@ -219,8 +259,11 @@ def iter_events(
                 ofs = int(row["ofs"])
             except (TypeError, ValueError):
                 continue
+            dev, ino = str(row["dev"]), str(row["ino"])
+            if exclude_files and make_file_key(dev, ino) in exclude_files:
+                continue
             yield (float(row["timestamp"]), int(row["sort_order"]), str(row["kind"]),
-                   str(row["dev"]), str(row["ino"]), ofs)
+                   dev, ino, ofs)
 
 
 def analyze(
@@ -229,6 +272,7 @@ def analyze(
     end: Optional[float],
     use_label: bool,
     label_gt: int,
+    exclude_files: Optional[set] = None,
 ) -> dict:
     # Per resident page: [add_ts, access_count, first_access_ts]
     A_ADD, A_CNT, A_FIRST = 0, 1, 2
@@ -245,7 +289,8 @@ def analyze(
     obs_max: Optional[float] = None
     total_events = 0
 
-    for ts, _sort, kind, dev, ino, ofs in iter_events(conn, start, end, use_label, label_gt):
+    for ts, _sort, kind, dev, ino, ofs in iter_events(
+        conn, start, end, use_label, label_gt, exclude_files):
         total_events += 1
         if obs_min is None:
             obs_min = ts
@@ -366,6 +411,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.set_defaults(use_label=True)
     p.add_argument("--label-access-gt", type=int, default=1,
                    help="A label row counts as an access when label > this (default 1).")
+    p.add_argument("--exclude-file", action="append", metavar="GLOB",
+                   help="Drop inodes whose inode_mapping.filename matches this glob "
+                        "(*/? wildcards), e.g. '/data/log/*'. Repeatable.")
     p.add_argument("--build-indices", action="store_true",
                    help="Create missing timestamp indexes (writes to DB, one-time).")
     return p.parse_args(argv)
@@ -382,8 +430,16 @@ def main(argv: Sequence[str]) -> int:
         print("WARNING: some event tables lack a timestamp index; using a full sort "
               "(slow on large DBs). Re-run with --build-indices once.", file=sys.stderr)
 
+    if args.exclude_file and not table_exists(conn, INODE_TABLE):
+        raise SystemExit("--exclude-file requires inode_mapping table.")
+    exclude_keys = resolve_excluded_file_keys(conn, args.exclude_file)
+    if args.exclude_file:
+        print(f"Excluding {len(exclude_keys)} inode(s) matching {args.exclude_file}",
+              file=sys.stderr)
+
     print("Analyzing cold pages...", file=sys.stderr)
-    stats = analyze(conn, args.start, args.end, args.use_label, args.label_access_gt)
+    stats = analyze(conn, args.start, args.end, args.use_label, args.label_access_gt,
+                    exclude_keys)
     per_file = stats.pop("_per_file")
     stats["topColdFiles"] = top_cold_files(conn, per_file, args.top)
 
