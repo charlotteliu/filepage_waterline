@@ -23,12 +23,36 @@ Field semantics (see CLAUDE.md for the full schema):
     command that dumped the bitmap, not a real accessor — it is never
     counted as a touching process.
   - "Touched by a process" is a priority cascade, not a union: if the page
-    has any `mm_filemap_access_history` rows, its owning process set is
-    the `pid_name`s from *those rows only*; else if it has any add rows,
-    the set is add's `pid_name`s; else (add- and access-less, delete only)
-    the set is delete's `pid_name`s. `--no-access` removes access-history
-    from consideration (falls through to add, then delete) if you want a
-    stricter/looser definition.
+    has any `mm_filemap_access_history` rows, its owner is decided by
+    *those rows only*; else if it has any add rows, by add's; else
+    (add- and access-less, delete only) by delete's. `--no-access` removes
+    access-history from consideration (falls through to add, then delete).
+
+Memory model (matters for 10s-of-GB DBs with 10s-100s of millions of
+distinct pages): the naive version of this (a dict keyed by the full
+`(dev,ino,ofs)` tuple, with a Python `set()` per page per event source)
+measured at 600-900 bytes/page in practice — mostly the fixed ~216-byte
+CPython overhead of *each empty set object*, tripled, plus a fresh 3-tuple
+key per page even though `dev`/`ino` repeat across every page of a file.
+That is what drove a 30GB DB past 20GB RSS. This version instead:
+  - Nests the aggregate as `{file_key -> {ofs -> state}}` (`file_key` =
+    interned `"dev|ino"`, same convention as `cold_page_stats.py`), so
+    `dev`/`ino` are stored once per *file*, not once per *page*.
+  - Packs the 6 boolean/flag bits (in_add, in_bitmap, has_mmapcnt, and one
+    "saw >1 distinct pid" bit per event source) into a single int, and
+    tracks each source's owning pid as a single nullable string slot
+    instead of a `set()` — sufficient because we only ever need to know
+    "is it exactly one distinct pid", never the full membership.
+  - Interns `pid_name` strings, which recur across millions of rows drawn
+    from a small process-name vocabulary.
+  - Frees the whole aggregate (`del agg`) as soon as the single summary
+    pass over it has extracted what's needed for reporting, instead of
+    holding it for the rest of the program.
+  - Only materializes as many qualifying-page rows as will actually be
+    printed/exported (`--top` bound) unless `--json`/`--csv` asks for the
+    full list — the running *count* is always exact regardless.
+This cuts the measured per-page footprint by roughly 5-8x (see the devlog
+for the tracemalloc benchmark) without changing any result.
 
 Usage:
   python3 outputs/single_process_page_stats.py --db ftrace.db \
@@ -50,22 +74,56 @@ ACCESS_TABLE = "mm_filemap_access_history"
 INODE_TABLE = "inode_mapping"
 
 PAGE_SIZE = 4096
-PageKey = Tuple[str, str, int]
 
-# Per-page aggregate: [in_add, in_bitmap, max_mmapcnt, has_mmapcnt_data,
-#                       add_pids, delete_pids, access_pids]
-(P_IN_ADD, P_IN_BITMAP, P_MMAPCNT, P_HAS_MMAPCNT,
- P_ADD_PIDS, P_DEL_PIDS, P_ACCESS_PIDS) = range(7)
+# Per-page state: [flags, max_mmapcnt, add_pid, delete_pid, access_pid].
+# add_pid/delete_pid/access_pid hold the *first* pid_name seen from that
+# source, or None if that source never touched this page; the matching
+# "_MULTI" flag bit is set the first time a *different* pid_name shows up
+# from that same source. This is enough to answer "exactly one distinct
+# pid from this source?" without ever storing a full set.
+S_FLAGS, S_MMAPCNT, S_ADD_PID, S_DEL_PID, S_ACCESS_PID = range(5)
+
+F_IN_ADD = 1
+F_IN_BITMAP = 2
+F_HAS_MMAPCNT = 4
+F_ADD_MULTI = 8
+F_DEL_MULTI = 16
+F_ACCESS_MULTI = 32
+
+_OWNER_SOURCES = (
+    (S_ACCESS_PID, F_ACCESS_MULTI, "access"),
+    (S_ADD_PID, F_ADD_MULTI, "add"),
+    (S_DEL_PID, F_DEL_MULTI, "delete"),
+)
 
 
-def owning_pids(st: list) -> Set[str]:
-    """Priority cascade: access-history pid_names win if any exist, else
-    add's, else (add- and access-less) delete's. Not a union."""
-    if st[P_ACCESS_PIDS]:
-        return st[P_ACCESS_PIDS]
-    if st[P_ADD_PIDS]:
-        return st[P_ADD_PIDS]
-    return st[P_DEL_PIDS]
+def make_file_key(dev: str, ino: str) -> str:
+    return f"{dev}|{ino}"
+
+
+def split_file_key(key: str) -> Tuple[str, str]:
+    dev, _, ino = key.partition("|")
+    return dev, ino
+
+
+def touch_pid(st: list, pid_slot: int, multi_bit: int, pid_name: str) -> None:
+    if not pid_name:
+        return
+    cur = st[pid_slot]
+    if cur is None:
+        st[pid_slot] = pid_name
+    elif cur != pid_name:
+        st[S_FLAGS] |= multi_bit
+
+
+def owner_info(st: list) -> Tuple[Optional[str], bool, str]:
+    """access > add > delete priority cascade. Returns (pid or None,
+    is_single_owner, source_name)."""
+    for pid_slot, multi_bit, source in _OWNER_SOURCES:
+        pid = st[pid_slot]
+        if pid is not None:
+            return pid, not (st[S_FLAGS] & multi_bit), source
+    return None, False, "none"
 
 
 def connect(db_path: str, writable: bool = False) -> sqlite3.Connection:
@@ -167,46 +225,56 @@ def collect(
     conn: sqlite3.Connection,
     start: Optional[float], end: Optional[float],
     use_access: bool,
-) -> Tuple[Dict[PageKey, list], collections.Counter]:
-    agg: Dict[PageKey, list] = {}
+) -> Tuple[Dict[str, Dict[int, list]], collections.Counter]:
+    agg: Dict[str, Dict[int, list]] = {}
     anomalies: collections.Counter = collections.Counter()
+    intern = sys.intern
 
-    def get(key: PageKey) -> list:
-        st = agg.get(key)
+    def get(file_key: str, ofs: int) -> list:
+        file_map = agg.get(file_key)
+        if file_map is None:
+            file_map = {}
+            agg[file_key] = file_map
+        st = file_map.get(ofs)
         if st is None:
-            st = [False, False, 0, False, set(), set(), set()]
-            agg[key] = st
+            st = [0, 0, None, None, None]
+            file_map[ofs] = st
         return st
+
+    def peek(file_key: str, ofs: int) -> Optional[list]:
+        file_map = agg.get(file_key)
+        return file_map.get(ofs) if file_map is not None else None
 
     where, params = _time_where(start, end)
 
     # bitmap: population membership only. Its pid_name is the shell command
-    # (e.g. `cat`) that dumped the bitmap, not a real accessor -> never
-    # counted as a touching process.
+    # (e.g. `cat`) that dumped the bitmap, not a real accessor -> not read.
     cur = conn.execute(f"SELECT dev, ino, page_ofs FROM {BITMAP_TABLE} {where}", params)
     while True:
         rows = cur.fetchmany(50000)
         if not rows:
             break
         for r in rows:
-            key = (str(r["dev"]), str(r["ino"]), int(r["page_ofs"]))
-            get(key)[P_IN_BITMAP] = True
+            file_key = intern(make_file_key(r["dev"], r["ino"]))
+            st = get(file_key, int(r["page_ofs"]))
+            st[S_FLAGS] |= F_IN_BITMAP
 
-    # add: population membership + mmapcnt + pid (fallback owner source).
+    # add: population membership + mmapcnt + pid (lowest-priority owner source).
     cur = conn.execute(f"SELECT dev, ino, ofs, mmapcnt, pid_name FROM {ADD_TABLE} {where}", params)
     while True:
         rows = cur.fetchmany(50000)
         if not rows:
             break
         for r in rows:
-            key = (str(r["dev"]), str(r["ino"]), int(r["ofs"]))
-            st = get(key)
-            st[P_IN_ADD] = True
-            st[P_HAS_MMAPCNT] = True
-            st[P_MMAPCNT] = max(st[P_MMAPCNT], int(r["mmapcnt"] or 0))
-            pid_name = str(r["pid_name"] or "")
+            file_key = intern(make_file_key(r["dev"], r["ino"]))
+            st = get(file_key, int(r["ofs"]))
+            st[S_FLAGS] |= F_IN_ADD | F_HAS_MMAPCNT
+            mmapcnt = int(r["mmapcnt"] or 0)
+            if mmapcnt > st[S_MMAPCNT]:
+                st[S_MMAPCNT] = mmapcnt
+            pid_name = r["pid_name"]
             if pid_name:
-                st[P_ADD_PIDS].add(pid_name)
+                touch_pid(st, S_ADD_PID, F_ADD_MULTI, intern(str(pid_name)))
 
     # delete: enrich mmapcnt + pid (last-resort owner source); does not, by
     # itself, define population.
@@ -217,19 +285,21 @@ def collect(
             if not rows:
                 break
             for r in rows:
-                key = (str(r["dev"]), str(r["ino"]), int(r["ofs"]))
-                st = agg.get(key)
-                if st is None:
+                file_key = intern(make_file_key(r["dev"], r["ino"]))
+                ofs = int(r["ofs"])
+                if peek(file_key, ofs) is None:
                     anomalies["delete_without_add_or_bitmap"] += 1
-                    st = get(key)  # keep the data; excluded from population at aggregation time
-                st[P_HAS_MMAPCNT] = True
-                st[P_MMAPCNT] = max(st[P_MMAPCNT], int(r["mmapcnt"] or 0))
-                pid_name = str(r["pid_name"] or "")
+                st = get(file_key, ofs)  # keep the data; excluded from population at aggregation time
+                st[S_FLAGS] |= F_HAS_MMAPCNT
+                mmapcnt = int(r["mmapcnt"] or 0)
+                if mmapcnt > st[S_MMAPCNT]:
+                    st[S_MMAPCNT] = mmapcnt
+                pid_name = r["pid_name"]
                 if pid_name:
-                    st[P_DEL_PIDS].add(pid_name)
+                    touch_pid(st, S_DEL_PID, F_DEL_MULTI, intern(str(pid_name)))
 
-    # access_history: enrich mmapcnt + pid; when present, its pids are the
-    # sole owner source (see owning_pids()), same as delete otherwise.
+    # access_history: enrich mmapcnt + pid; when present, its pid is the
+    # highest-priority owner source (see owner_info()).
     if use_access and table_exists(conn, ACCESS_TABLE):
         cur = conn.execute(f"SELECT dev, ino, ofs, mmapcnt, pid_name FROM {ACCESS_TABLE} {where}", params)
         while True:
@@ -237,45 +307,68 @@ def collect(
             if not rows:
                 break
             for r in rows:
-                key = (str(r["dev"]), str(r["ino"]), int(r["ofs"]))
-                st = agg.get(key)
-                if st is None:
+                file_key = intern(make_file_key(r["dev"], r["ino"]))
+                ofs = int(r["ofs"])
+                if peek(file_key, ofs) is None:
                     anomalies["access_without_add_or_bitmap"] += 1
-                    st = get(key)
-                st[P_HAS_MMAPCNT] = True
-                st[P_MMAPCNT] = max(st[P_MMAPCNT], int(r["mmapcnt"] or 0))
-                pid_name = str(r["pid_name"] or "")
+                st = get(file_key, ofs)
+                st[S_FLAGS] |= F_HAS_MMAPCNT
+                mmapcnt = int(r["mmapcnt"] or 0)
+                if mmapcnt > st[S_MMAPCNT]:
+                    st[S_MMAPCNT] = mmapcnt
+                pid_name = r["pid_name"]
                 if pid_name:
-                    st[P_ACCESS_PIDS].add(pid_name)
+                    touch_pid(st, S_ACCESS_PID, F_ACCESS_MULTI, intern(str(pid_name)))
 
     return agg, anomalies
 
 
-def analyze(agg: Dict[PageKey, list]) -> dict:
-    population = [k for k, st in agg.items() if st[P_IN_ADD] or st[P_IN_BITMAP]]
-    pop_count = len(population)
-
+def analyze(agg: Dict[str, Dict[int, list]], keep_limit: Optional[int]) -> dict:
+    """Single pass over the aggregate. `keep_limit` bounds how many
+    qualifying-page rows are materialized (None = keep all, needed for
+    --json/--csv); the reported counts are always exact regardless."""
+    pop_count = 0
     in_add_only = in_bitmap_only = in_both = 0
     no_mmapcnt_data = 0
-    qualifying: List[PageKey] = []
+    qual_count = 0
+    qualifying_rows: List[dict] = []
 
-    for key in population:
-        st = agg[key]
-        if st[P_IN_ADD] and st[P_IN_BITMAP]:
-            in_both += 1
-        elif st[P_IN_ADD]:
-            in_add_only += 1
-        else:
-            in_bitmap_only += 1
+    for file_key, file_map in agg.items():
+        dev, ino = split_file_key(file_key)
+        for ofs, st in file_map.items():
+            flags = st[S_FLAGS]
+            in_add = bool(flags & F_IN_ADD)
+            in_bitmap = bool(flags & F_IN_BITMAP)
+            if not (in_add or in_bitmap):
+                continue  # delete/access-only anomaly entry, not population
 
-        if not st[P_HAS_MMAPCNT]:
-            no_mmapcnt_data += 1
-            continue  # bitmap-only page: no mmapcnt data -> can't be "mmapcnt==0"
+            pop_count += 1
+            if in_add and in_bitmap:
+                in_both += 1
+            elif in_add:
+                in_add_only += 1
+            else:
+                in_bitmap_only += 1
 
-        if st[P_MMAPCNT] == 0 and len(owning_pids(st)) == 1:
-            qualifying.append(key)
+            if not (flags & F_HAS_MMAPCNT):
+                no_mmapcnt_data += 1
+                continue  # bitmap-only page: no mmapcnt data -> can't be "mmapcnt==0"
+            if st[S_MMAPCNT] != 0:
+                continue
 
-    qual_count = len(qualifying)
+            pid, is_single, source = owner_info(st)
+            if pid is None or not is_single:
+                continue
+
+            qual_count += 1
+            if keep_limit is None or len(qualifying_rows) < keep_limit:
+                qualifying_rows.append({
+                    "dev": dev, "ino": ino, "ofs": ofs,
+                    "maxMmapcnt": st[S_MMAPCNT],
+                    "owningProcess": pid, "ownerSource": source,
+                    "inAdd": in_add, "inBitmap": in_bitmap,
+                })
+
     pct = (qual_count / pop_count * 100.0) if pop_count else 0.0
 
     return {
@@ -290,7 +383,7 @@ def analyze(agg: Dict[PageKey, list]) -> dict:
             "pageCount": qual_count,
             "percentOfPopulation": round(pct, 4),
         },
-        "_qualifying_keys": qualifying,
+        "_qualifying_rows": qualifying_rows,
     }
 
 
@@ -324,8 +417,11 @@ def main(argv: Sequence[str]) -> int:
 
     print("Scanning add/delete/bitmap" + ("/access" if args.use_access else "") + " tables...", file=sys.stderr)
     agg, anomalies = collect(conn, args.start, args.end, args.use_access)
-    stats = analyze(agg)
-    qualifying_keys = stats.pop("_qualifying_keys")
+
+    need_full_export = bool(args.json or args.csv)
+    stats = analyze(agg, keep_limit=None if need_full_export else args.top)
+    qualifying_rows = stats.pop("_qualifying_rows")
+    del agg  # the aggregate can be tens of GB on large DBs; drop it before any reporting work
 
     pop = stats["population"]
     own = stats["singleOwnerUnmapped"]
@@ -339,28 +435,18 @@ def main(argv: Sequence[str]) -> int:
         print(f"Anomalies: {dict(anomalies)}", file=sys.stderr)
 
     filenames: Dict[Tuple[str, str], str] = {}
-    if table_exists(conn, INODE_TABLE) and qualifying_keys:
-        filenames = resolve_filenames_by_ino(conn, {(dev, ino) for dev, ino, _ofs in qualifying_keys})
+    if table_exists(conn, INODE_TABLE) and qualifying_rows:
+        filenames = resolve_filenames_by_ino(conn, {(r["dev"], r["ino"]) for r in qualifying_rows})
+    for r in qualifying_rows:
+        r["pageIdx"] = r["ofs"] // args.page_size
+        r["filename"] = filenames.get((r["dev"], r["ino"]), "")
 
-    def qual_row(key: PageKey) -> dict:
-        dev, ino, ofs = key
-        st = agg[key]
-        pid = next(iter(owning_pids(st)), "")
-        owner_source = "access" if st[P_ACCESS_PIDS] else ("add" if st[P_ADD_PIDS] else "delete")
-        return {
-            "dev": dev, "ino": ino, "ofs": ofs, "pageIdx": ofs // args.page_size,
-            "filename": filenames.get((dev, ino), ""),
-            "maxMmapcnt": st[P_MMAPCNT], "owningProcess": pid, "ownerSource": owner_source,
-            "inAdd": st[P_IN_ADD], "inBitmap": st[P_IN_BITMAP],
-        }
-
-    if qualifying_keys:
+    if qualifying_rows:
         print("", file=sys.stderr)
-        print(f"Top {min(args.top, len(qualifying_keys))} single-owner unmapped pages:", file=sys.stderr)
+        print(f"Top {min(args.top, len(qualifying_rows))} single-owner unmapped pages:", file=sys.stderr)
         header = f"{'dev':>8} {'ino':>12} {'ofs':>12} {'pageIdx':>9}  owningProcess(source)  filename"
         print(header, file=sys.stderr)
-        for key in qualifying_keys[: args.top]:
-            r = qual_row(key)
+        for r in qualifying_rows[: args.top]:
             print(f"{r['dev']:>8} {r['ino']:>12} {r['ofs']:>12} {r['pageIdx']:>9}  "
                   f"{r['owningProcess']}({r['ownerSource']})  {r['filename']}", file=sys.stderr)
 
@@ -370,7 +456,7 @@ def main(argv: Sequence[str]) -> int:
             "useAccess": args.use_access,
         }
         stats["anomalies"] = dict(anomalies)
-        stats["qualifyingPages"] = [qual_row(k) for k in qualifying_keys]
+        stats["qualifyingPages"] = qualifying_rows
         with open(args.json, "w") as f:
             json.dump(stats, f, indent=2, ensure_ascii=False)
         print(f"Wrote {os.path.abspath(args.json)}", file=sys.stderr)
@@ -378,8 +464,7 @@ def main(argv: Sequence[str]) -> int:
     if args.csv:
         with open(args.csv, "w") as f:
             f.write("dev,ino,ofs,page_idx,filename,max_mmapcnt,owning_process,owner_source,in_add,in_bitmap\n")
-            for key in qualifying_keys:
-                r = qual_row(key)
+            for r in qualifying_rows:
                 fn = str(r["filename"]).replace('"', '""')
                 f.write(
                     f"{r['dev']},{r['ino']},{r['ofs']},{r['pageIdx']},\"{fn}\","
