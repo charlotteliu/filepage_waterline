@@ -56,3 +56,48 @@ python3 outputs/bitmap_filemap_diff.py --db ftrace.db --all-bitmap-files \
 - 单文件模式当前 `--ino`/`--dev` 需要用户手动定位；如果常用场景是"给定文件名找 bitmap 缺口"，可以让批量模式也支持 `--file-like` 作为**过滤器**（而不是唯一定位），先圈定候选集合再跑批量对比。
 - 批量模式目前只统计计数，没有像单文件模式一样导出逐页明细；如果需要对 Top N 文件做页级下钻，可以加一个 `--detail-top N` 复用 `build_missing_records` 逐个文件补全。
 - 复用 `--start`/`--end` 时间窗口时，`bothPages=0` 的"假交集缺失"文件可能只是窗口切得不巧（该文件驻留区间横跨窗口边界），后续可以考虑把窗口外但邻近的 add/delete 事件也纳入判断。
+
+## 追加：Issue #1「filemap bitmap diff加强」
+
+GitHub issue [#1](https://github.com/charlotteliu/filepage_waterline/issues/1) 用真实大库（`ftrace_ultimate_data_0602.db`，`--all-bitmap-files` 输出 5,567 个 bitmap 文件 / 149 万 filemap 页）提了 3 个具体缺陷，本次逐一修复：
+
+### 1. inode_mapping 按 (dev,ino) 精确匹配导致文件名丢失
+
+**问题**：`inode_mapping.dev` 和 ftrace 事件表上报的 dev 不一定一致（采集路径不同），原实现要求 `dev=? AND ino=?` 精确匹配，dev 一旦对不上就查不到文件名。
+
+**修复**：新增 `resolve_filenames_by_ino(conn, keys)`，只用 `ino` 去 `inode_mapping` 查（`ino` 本来就是该表主键，天然唯一）。但报告自身范围内（例如批量模式收集到的全部 `(dev,ino)`）如果同一个 `ino` 挂在**两个不同的 dev** 下（不同文件系统/挂载点复用了相同 inode 号，或者采集路径不一致导致同一个文件被记成了两个 dev），就是真正的歧义——不知道这条 `inode_mapping` 记录到底描述哪一个，两边都不填文件名，只显示 `dev:ino`。单文件模式只有一个 key，天然不会有这种歧义，因此只要 ino 命中就一定能拿到文件名（即使 dev 对不上）。
+
+用合成数据验证：ino 命中但 inode_mapping 里 dev 是错的（且我们自己范围内该 ino 只对应一个 dev）→ 正确拿到文件名；同一个 ino 在批量结果里挂了两个不同 dev → 两行文件名都正确留空。
+
+### 2. 缺少 add/access 进程追踪
+
+**问题**：只知道页被谁 add/delete（`lastPidName`，还只是最后一次），看不出这个文件到底被哪些进程写入、被哪些进程访问过。
+
+**修复**：
+- 单文件模式：`load_filemap_aggregate` 新增按 ofs 记录 `addProcesses`（add 事件的 pid_name 集合），新增 `annotate_access_processes()` 读 `mm_filemap_access_history` 补上每个 ofs 的 `accessProcesses`。
+- 批量模式：`load_filemap_offsets_for_keys` 顺带收集每个文件的 add 进程集合；新增 `load_access_procs_for_keys()` 对 `mm_filemap_access_history` 做同样的单遍全表扫描 + key-set 过滤，收集每个文件的 access 进程集合。
+- 两处都作为新增列（JSON 列表 / CSV 分号分隔字符串）输出，不影响原有字段。
+- `mm_filemap_access_history` 是可选表（不存在时该功能静默跳过，不报错）。
+
+真实库 `mm_filemap_access_history` 有 152 万行，批量模式加上这一遍扫描后总耗时从 1.2s 涨到 3.3s（423 个文件），仍然可接受；用合成数据验证了单页多进程 add / 多进程 access 的场景，列表内容和排序（`sorted()`）符合预期。
+
+### 3. 导出只能写 CSV，一次只有一份
+
+**问题**："完整输出信息写 CSV，需要能按需要写到不同的表"——原来只有 `--csv`，每次固定文件、固定单一结构，不方便把多次跑的结果落到同一个库里分表管理、后续用 SQL 查询/关联。
+
+**修复**：新增 `--sqlite-out PATH [--sqlite-table NAME]`，把报告写入（DROP+CREATE，覆盖式刷新而非追加）一个独立可指定名字的 SQLite 表：
+- 单文件模式默认表名 `bitmap_filemap_diff_single`，列在原 CSV 基础上补了 `dev`/`ino`（CSV 本身省略是因为单次运行只对应一个文件，SQLite 表要独立可查询所以补全）。
+- 批量模式默认表名 `bitmap_filemap_diff_batch`。
+- 用 `--sqlite-table` 可以按次/按库自定义表名，同一个输出库里可以并存多次分析结果。
+
+用合成数据验证了两种模式写表都成功，字段类型和内容通过独立连接读回核对一致。
+
+### 验证汇总
+
+- 合成数据覆盖了三个缺陷各自的边界场景（dev 错配但唯一可解析 / 同 ino 跨两个 dev 的真歧义 / 多进程 add 与 access / 两种模式的 sqlite 落表）。
+- 真实库 `Camera_0030.db` 重新跑单文件与批量模式：**总量结果与加固前完全一致**（423 个 bitmap 文件、164 个有交集、filemap-only 1,616、bitmap-only 27,861），确认三处改动没有影响原有对比逻辑，只是新增字段/新增文件名解析路径。
+- 批量模式性能：3.3 秒（含新增的 access_history 152 万行扫描），可接受。
+
+### 未做 / 留给用户确认
+
+- 无法用 `gh` CLI 或直接网络访问关闭该 issue（本环境沙箱无出网权限，`gh` 也未安装），已用 `WebFetch` 读取 issue 内容用于确认需求，但没有写权限去评论/关闭；需要用户自行在 GitHub 上处理。

@@ -30,10 +30,27 @@ Two modes:
     asking "of the files bitmap actually saw, which ones does it disagree
     with filemap on?" across the whole DB.
 
+Every row (single-file page or batch-mode file) also carries the set of
+process names (`pid_name`) that added pages (`addProcesses`, from
+mm_filemap_add_to_page_cache) and that accessed them (`accessProcesses`,
+from mm_filemap_access_history), so you can see who's driving the gap.
+
+Filenames are resolved from `inode_mapping` by **ino alone** — its `dev`
+column doesn't reliably agree with the dev an ftrace event reports for the
+same file. If one ino shows up under more than one distinct dev in the
+report (ambiguous: which file does the inode_mapping row belong to?), the
+filename is left blank for all of them rather than guessed.
+
+Besides `--json`/`--csv`, `--sqlite-out PATH [--sqlite-table NAME]` writes
+the report into a (re)created table in a SQLite DB, so it can be queried or
+joined against other tables instead of just skimmed as a flat file.
+
 Usage:
   python3 outputs/bitmap_filemap_diff.py --db ftrace.db --ino 0x1234 --dev 8:1
   python3 outputs/bitmap_filemap_diff.py --db ftrace.db --file-like '%libfoo.so%'
   python3 outputs/bitmap_filemap_diff.py --db ftrace.db --all-bitmap-files --csv report.csv
+  python3 outputs/bitmap_filemap_diff.py --db ftrace.db --all-bitmap-files \
+    --sqlite-out report.db --sqlite-table camera_0030_batch
 """
 
 import argparse
@@ -47,14 +64,17 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 BITMAP_TABLE = "bitmap_page_info"
 ADD_TABLE = "mm_filemap_add_to_page_cache"
 DELETE_TABLE = "mm_filemap_delete_from_page_cache"
+ACCESS_TABLE = "mm_filemap_access_history"
 INODE_TABLE = "inode_mapping"
 
 PAGE_SIZE = 4096
 FileKey = Tuple[str, str]
 
 # Per-ofs aggregate: [add_count, del_count, first_add_ts, last_add_ts,
-#                      first_del_ts, last_del_ts, max_mmapcnt, last_pid_name]
-A_ADDN, A_DELN, A_FIRST_ADD, A_LAST_ADD, A_FIRST_DEL, A_LAST_DEL, A_MMAPCNT, A_PID = range(8)
+#                      first_del_ts, last_del_ts, max_mmapcnt, last_pid_name,
+#                      add_pid_names, access_pid_names]
+(A_ADDN, A_DELN, A_FIRST_ADD, A_LAST_ADD, A_FIRST_DEL, A_LAST_DEL, A_MMAPCNT, A_PID,
+ A_ADD_PIDS, A_ACCESS_PIDS) = range(10)
 
 
 def connect(db_path: str, writable: bool = False) -> sqlite3.Connection:
@@ -118,6 +138,36 @@ def normalize_ino(raw: str) -> str:
     return f"0x{val:x}"
 
 
+def resolve_filenames_by_ino(conn: sqlite3.Connection, keys: Set[FileKey]) -> Dict[FileKey, str]:
+    """Map (dev,ino) -> filename via inode_mapping, matched on ino alone.
+
+    inode_mapping's `dev` column doesn't reliably agree with the dev an
+    ftrace event reports for the same file, so dev is not used as a join
+    key (`ino` is inode_mapping's primary key, so it's unique there already).
+    If the same ino shows up under more than one distinct dev within `keys`
+    — i.e. we can't tell which of those files the inode_mapping row actually
+    describes — it's left unresolved for all of them; callers fall back to
+    showing bare dev:ino instead of guessing."""
+    if not table_exists(conn, INODE_TABLE) or not keys:
+        return {}
+    ino_devs: Dict[str, Set[str]] = collections.defaultdict(set)
+    for dev, ino in keys:
+        ino_devs[ino].add(dev)
+    inos = set(ino_devs)
+
+    fn_by_ino: Dict[str, str] = {}
+    for r in conn.execute(f"SELECT ino, filename FROM {INODE_TABLE}"):
+        ino = str(r["ino"])
+        if ino in inos and r["filename"]:
+            fn_by_ino[ino] = str(r["filename"])
+
+    result: Dict[FileKey, str] = {}
+    for dev, ino in keys:
+        if ino in fn_by_ino and len(ino_devs[ino]) == 1:
+            result[(dev, ino)] = fn_by_ino[ino]
+    return result
+
+
 def resolve_target(conn: sqlite3.Connection, args: argparse.Namespace) -> Tuple[str, str, str]:
     """Returns (dev, ino, filename)."""
     if args.file_like:
@@ -155,13 +205,7 @@ def resolve_target(conn: sqlite3.Connection, args: argparse.Namespace) -> Tuple[
             )
         dev = next(iter(devs))
 
-    filename = ""
-    if table_exists(conn, INODE_TABLE):
-        row = conn.execute(
-            f"SELECT filename FROM {INODE_TABLE} WHERE dev=? AND ino=?", (dev, ino)
-        ).fetchone()
-        if row and row["filename"]:
-            filename = str(row["filename"])
+    filename = resolve_filenames_by_ino(conn, {(dev, ino)}).get((dev, ino), "")
     return dev, ino, filename
 
 
@@ -216,7 +260,7 @@ def load_filemap_aggregate(
     def get(ofs: int) -> list:
         st = agg.get(ofs)
         if st is None:
-            st = [0, 0, None, None, None, None, 0, ""]
+            st = [0, 0, None, None, None, None, 0, "", set(), set()]
             agg[ofs] = st
         return st
 
@@ -230,12 +274,15 @@ def load_filemap_aggregate(
         for r in rows:
             ofs = int(r["ofs"])
             ts = float(r["timestamp"])
+            pid_name = str(r["pid_name"] or "")
             st = get(ofs)
             st[A_ADDN] += 1
             st[A_FIRST_ADD] = ts if st[A_FIRST_ADD] is None else min(st[A_FIRST_ADD], ts)
             st[A_LAST_ADD] = ts if st[A_LAST_ADD] is None else max(st[A_LAST_ADD], ts)
             st[A_MMAPCNT] = max(st[A_MMAPCNT], int(r["mmapcnt"] or 0))
-            st[A_PID] = str(r["pid_name"] or "")
+            st[A_PID] = pid_name
+            if pid_name:
+                st[A_ADD_PIDS].add(pid_name)
 
     cur = conn.execute(
         f"SELECT ofs, timestamp, mmapcnt, pid_name FROM {DELETE_TABLE} WHERE {where}", params
@@ -257,6 +304,37 @@ def load_filemap_aggregate(
     return agg
 
 
+def annotate_access_processes(
+    conn: sqlite3.Connection, dev: str, ino: str,
+    start: Optional[float], end: Optional[float], agg: Dict[int, list],
+) -> None:
+    """Add each ofs's accessing pid_names (from mm_filemap_access_history) into
+    agg[ofs][A_ACCESS_PIDS]. Only annotates offsets that already have an
+    add/delete record; access_history has no separate "add" concept."""
+    if not table_exists(conn, ACCESS_TABLE):
+        return
+    clauses = ["dev = ?", "ino = ?"]
+    params: List[object] = [dev, ino]
+    if start is not None:
+        clauses.append("timestamp >= ?"); params.append(start)
+    if end is not None:
+        clauses.append("timestamp <= ?"); params.append(end)
+    where = " AND ".join(clauses)
+
+    cur = conn.execute(f"SELECT ofs, pid_name FROM {ACCESS_TABLE} WHERE {where}", params)
+    while True:
+        rows = cur.fetchmany(50000)
+        if not rows:
+            break
+        for r in rows:
+            st = agg.get(int(r["ofs"]))
+            if st is None:
+                continue
+            pid_name = str(r["pid_name"] or "")
+            if pid_name:
+                st[A_ACCESS_PIDS].add(pid_name)
+
+
 def build_missing_records(
     agg: Dict[int, list], missing_offsets: set, page_size: int
 ) -> List[dict]:
@@ -275,6 +353,8 @@ def build_missing_records(
             "stillResident": st[A_ADDN] > st[A_DELN],
             "maxMmapcnt": st[A_MMAPCNT],
             "lastPidName": st[A_PID],
+            "addProcesses": sorted(st[A_ADD_PIDS]),
+            "accessProcesses": sorted(st[A_ACCESS_PIDS]),
         })
     return records
 
@@ -284,6 +364,63 @@ SORT_KEYS = {
     "add_count": lambda r: (-r["addCount"], r["ofs"]),
     "first_add_ts": lambda r: (r["firstAddTs"] if r["firstAddTs"] is not None else 0.0, r["ofs"]),
 }
+
+DEFAULT_SINGLE_TABLE = "bitmap_filemap_diff_single"
+DEFAULT_BATCH_TABLE = "bitmap_filemap_diff_batch"
+
+SINGLE_SQLITE_COLUMNS = [
+    ("dev", "TEXT"), ("ino", "TEXT"), ("ofs", "INTEGER"), ("page_idx", "INTEGER"),
+    ("add_count", "INTEGER"), ("del_count", "INTEGER"),
+    ("first_add_ts", "REAL"), ("last_add_ts", "REAL"),
+    ("first_del_ts", "REAL"), ("last_del_ts", "REAL"),
+    ("still_resident", "INTEGER"), ("max_mmapcnt", "INTEGER"),
+    ("last_pid_name", "TEXT"), ("add_processes", "TEXT"), ("access_processes", "TEXT"),
+]
+
+BATCH_SQLITE_COLUMNS = [
+    ("dev", "TEXT"), ("ino", "TEXT"), ("filename", "TEXT"),
+    ("bitmap_pages", "INTEGER"), ("bitmap_raw_rows", "INTEGER"),
+    ("filemap_pages", "INTEGER"), ("both_pages", "INTEGER"),
+    ("filemap_only_pages", "INTEGER"), ("filemap_only_fraction", "REAL"),
+    ("bitmap_only_pages", "INTEGER"), ("bitmap_only_fraction", "REAL"),
+    ("add_processes", "TEXT"), ("access_processes", "TEXT"),
+]
+
+
+def write_sqlite_table(
+    db_path: str, table: str, columns: List[Tuple[str, str]], row_tuples: List[tuple]
+) -> None:
+    """(Re)creates `table` in db_path and bulk-inserts row_tuples. Overwrites
+    any existing table of the same name so repeated runs stay a fresh
+    snapshot rather than an ever-growing append."""
+    conn = sqlite3.connect(db_path)
+    try:
+        col_defs = ", ".join(f"{name} {sql_type}" for name, sql_type in columns)
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+        conn.execute(f"CREATE TABLE {table} ({col_defs})")
+        placeholders = ", ".join("?" for _ in columns)
+        conn.executemany(f"INSERT INTO {table} VALUES ({placeholders})", row_tuples)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def single_row_to_sqlite_tuple(dev: str, ino: str, r: dict) -> tuple:
+    return (
+        dev, ino, r["ofs"], r["pageIdx"], r["addCount"], r["delCount"],
+        r["firstAddTs"], r["lastAddTs"], r["firstDelTs"], r["lastDelTs"],
+        1 if r["stillResident"] else 0, r["maxMmapcnt"], r["lastPidName"],
+        ",".join(r["addProcesses"]), ",".join(r["accessProcesses"]),
+    )
+
+
+def batch_row_to_sqlite_tuple(r: dict) -> tuple:
+    return (
+        r["dev"], r["ino"], r["filename"], r["bitmapPages"], r["bitmapRawRows"],
+        r["filemapPages"], r["bothPages"], r["filemapOnlyPages"], r["filemapOnlyFraction"],
+        r["bitmapOnlyPages"], r["bitmapOnlyFraction"],
+        ",".join(r["addProcesses"]), ",".join(r["accessProcesses"]),
+    )
 
 
 def run_single(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
@@ -296,6 +433,7 @@ def run_single(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
 
     bitmap_offsets, bitmap_raw_rows, bmin, bmax = load_bitmap_offsets(conn, dev, ino, args.start, args.end)
     agg = load_filemap_aggregate(conn, dev, ino, args.start, args.end)
+    annotate_access_processes(conn, dev, ino, args.start, args.end, agg)
     filemap_offsets = set(agg.keys())
 
     missing = filemap_offsets - bitmap_offsets   # filemap add/delete seen, bitmap never saw
@@ -341,14 +479,15 @@ def run_single(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     if missing_records:
         print("", file=sys.stderr)
         print(f"Top {min(args.top, len(missing_records))} filemap-only pages (sort={args.sort_by}):", file=sys.stderr)
-        header = f"{'ofs':>12} {'pageIdx':>9} {'add':>4} {'del':>4} {'firstAdd':>12} {'lastDel':>12} {'resident':>8} {'pidName'}"
+        header = (f"{'ofs':>12} {'pageIdx':>9} {'add':>4} {'del':>4} {'firstAdd':>12} {'lastDel':>12} "
+                  f"{'resident':>8}  addProcs  accessProcs")
         print(header, file=sys.stderr)
         for r in missing_records[: args.top]:
             print(
                 f"{r['ofs']:>12} {r['pageIdx']:>9} {r['addCount']:>4} {r['delCount']:>4} "
                 f"{('%.6f' % r['firstAddTs']) if r['firstAddTs'] is not None else '-':>12} "
                 f"{('%.6f' % r['lastDelTs']) if r['lastDelTs'] is not None else '-':>12} "
-                f"{str(r['stillResident']):>8} {r['lastPidName']}",
+                f"{str(r['stillResident']):>8}  {','.join(r['addProcesses'])}  {','.join(r['accessProcesses'])}",
                 file=sys.stderr,
             )
 
@@ -360,17 +499,29 @@ def run_single(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     if args.csv:
         with open(args.csv, "w") as f:
             f.write("ofs,page_idx,add_count,del_count,first_add_ts,last_add_ts,"
-                     "first_del_ts,last_del_ts,still_resident,max_mmapcnt,last_pid_name\n")
+                     "first_del_ts,last_del_ts,still_resident,max_mmapcnt,last_pid_name,"
+                     "add_processes,access_processes\n")
             for r in missing_records:
+                add_procs = ";".join(r["addProcesses"]).replace('"', '""')
+                access_procs = ";".join(r["accessProcesses"]).replace('"', '""')
                 f.write(
                     f"{r['ofs']},{r['pageIdx']},{r['addCount']},{r['delCount']},"
                     f"{r['firstAddTs'] if r['firstAddTs'] is not None else ''},"
                     f"{r['lastAddTs'] if r['lastAddTs'] is not None else ''},"
                     f"{r['firstDelTs'] if r['firstDelTs'] is not None else ''},"
                     f"{r['lastDelTs'] if r['lastDelTs'] is not None else ''},"
-                    f"{r['stillResident']},{r['maxMmapcnt']},\"{r['lastPidName']}\"\n"
+                    f"{r['stillResident']},{r['maxMmapcnt']},\"{r['lastPidName']}\","
+                    f"\"{add_procs}\",\"{access_procs}\"\n"
                 )
         print(f"Wrote {os.path.abspath(args.csv)}", file=sys.stderr)
+
+    if args.sqlite_out:
+        table = args.sqlite_table or DEFAULT_SINGLE_TABLE
+        write_sqlite_table(
+            args.sqlite_out, table, SINGLE_SQLITE_COLUMNS,
+            [single_row_to_sqlite_tuple(dev, ino, r) for r in missing_records],
+        )
+        print(f"Wrote table '{table}' in {os.path.abspath(args.sqlite_out)}", file=sys.stderr)
 
     return 0
 
@@ -407,13 +558,14 @@ def load_bitmap_all(
 def load_filemap_offsets_for_keys(
     conn: sqlite3.Connection, keys: Set[FileKey],
     start: Optional[float], end: Optional[float],
-) -> Dict[FileKey, Set[int]]:
+) -> Tuple[Dict[FileKey, Set[int]], Dict[FileKey, Set[str]]]:
     """Single full-table-scan pass over add+delete, keeping only inodes in `keys`.
 
     Mirrors the --file-like key-set pattern used in fscache_residency.py
     (Python membership test up front, not one SQL query per inode) so batch
     mode stays a fixed number of table scans regardless of how many bitmap
-    files there are."""
+    files there are. Also collects, per key, the set of pid_names that added
+    a page (delete rows don't count as "adding")."""
     clauses: List[str] = []
     params: List[object] = []
     if start is not None:
@@ -422,9 +574,10 @@ def load_filemap_offsets_for_keys(
         clauses.append("timestamp <= ?"); params.append(end)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
-    result: Dict[FileKey, Set[int]] = {}
+    offsets: Dict[FileKey, Set[int]] = {}
+    add_procs: Dict[FileKey, Set[str]] = {}
     for table in (ADD_TABLE, DELETE_TABLE):
-        cur = conn.execute(f"SELECT dev, ino, ofs FROM {table} {where}", params)
+        cur = conn.execute(f"SELECT dev, ino, ofs, pid_name FROM {table} {where}", params)
         while True:
             rows = cur.fetchmany(50000)
             if not rows:
@@ -433,7 +586,43 @@ def load_filemap_offsets_for_keys(
                 key = (str(r["dev"]), str(r["ino"]))
                 if key not in keys:
                     continue
-                result.setdefault(key, set()).add(int(r["ofs"]))
+                offsets.setdefault(key, set()).add(int(r["ofs"]))
+                if table == ADD_TABLE:
+                    pid_name = str(r["pid_name"] or "")
+                    if pid_name:
+                        add_procs.setdefault(key, set()).add(pid_name)
+    return offsets, add_procs
+
+
+def load_access_procs_for_keys(
+    conn: sqlite3.Connection, keys: Set[FileKey],
+    start: Optional[float], end: Optional[float],
+) -> Dict[FileKey, Set[str]]:
+    """Single full-table-scan pass over mm_filemap_access_history, keeping only
+    inodes in `keys` (same key-set pattern as load_filemap_offsets_for_keys)."""
+    if not table_exists(conn, ACCESS_TABLE):
+        return {}
+    clauses: List[str] = []
+    params: List[object] = []
+    if start is not None:
+        clauses.append("timestamp >= ?"); params.append(start)
+    if end is not None:
+        clauses.append("timestamp <= ?"); params.append(end)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    result: Dict[FileKey, Set[str]] = {}
+    cur = conn.execute(f"SELECT dev, ino, pid_name FROM {ACCESS_TABLE} {where}", params)
+    while True:
+        rows = cur.fetchmany(50000)
+        if not rows:
+            break
+        for r in rows:
+            key = (str(r["dev"]), str(r["ino"]))
+            if key not in keys:
+                continue
+            pid_name = str(r["pid_name"] or "")
+            if pid_name:
+                result.setdefault(key, set()).add(pid_name)
     return result
 
 
@@ -442,6 +631,8 @@ def build_batch_report(
     bitmap_raw_counts: Dict[FileKey, int],
     filemap_sets: Dict[FileKey, Set[int]],
     filenames: Dict[FileKey, str],
+    add_procs: Dict[FileKey, Set[str]],
+    access_procs: Dict[FileKey, Set[str]],
 ) -> List[dict]:
     rows = []
     for key, bset in bitmap_sets.items():
@@ -460,6 +651,8 @@ def build_batch_report(
             "filemapOnlyFraction": round(fm_only / len(fset), 6) if fset else 0.0,
             "bitmapOnlyPages": bm_only,
             "bitmapOnlyFraction": round(bm_only / len(bset), 6) if bset else 0.0,
+            "addProcesses": sorted(add_procs.get(key, set())),
+            "accessProcesses": sorted(access_procs.get(key, set())),
         })
     return rows
 
@@ -488,16 +681,14 @@ def run_batch(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     keys = set(bitmap_sets.keys())
     print(f"Bitmap observed {len(keys):,} distinct (dev,ino) files.", file=sys.stderr)
 
-    filenames: Dict[FileKey, str] = {}
-    if table_exists(conn, INODE_TABLE):
-        for r in conn.execute(f"SELECT dev, ino, filename FROM {INODE_TABLE}"):
-            key = (str(r["dev"]), str(r["ino"]))
-            if key in keys and r["filename"]:
-                filenames[key] = str(r["filename"])
+    filenames = resolve_filenames_by_ino(conn, keys)
 
-    filemap_sets = load_filemap_offsets_for_keys(conn, keys, args.start, args.end)
+    filemap_sets, add_procs = load_filemap_offsets_for_keys(conn, keys, args.start, args.end)
+    access_procs = load_access_procs_for_keys(conn, keys, args.start, args.end)
 
-    rows = build_batch_report(bitmap_sets, bitmap_raw_counts, filemap_sets, filenames)
+    rows = build_batch_report(
+        bitmap_sets, bitmap_raw_counts, filemap_sets, filenames, add_procs, access_procs
+    )
     rows.sort(key=BATCH_SORT_KEYS[args.rank_by])
 
     totals = {
@@ -531,12 +722,13 @@ def run_batch(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
         print("", file=sys.stderr)
         print(f"Top {min(args.top, len(rows))} files (rank-by={args.rank_by}):", file=sys.stderr)
         header = (f"{'dev':>8} {'ino':>12} {'bitmapPg':>9} {'filemapPg':>10} "
-                  f"{'both':>7} {'fmOnly':>7} {'bmOnly':>7}  filename")
+                  f"{'both':>7} {'fmOnly':>7} {'bmOnly':>7}  filename  addProcs  accessProcs")
         print(header, file=sys.stderr)
         for r in rows[: args.top]:
             print(
                 f"{r['dev']:>8} {r['ino']:>12} {r['bitmapPages']:>9} {r['filemapPages']:>10} "
-                f"{r['bothPages']:>7} {r['filemapOnlyPages']:>7} {r['bitmapOnlyPages']:>7}  {r['filename']}",
+                f"{r['bothPages']:>7} {r['filemapOnlyPages']:>7} {r['bitmapOnlyPages']:>7}  "
+                f"{r['filename']}  {','.join(r['addProcesses'])}  {','.join(r['accessProcesses'])}",
                 file=sys.stderr,
             )
 
@@ -548,15 +740,27 @@ def run_batch(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     if args.csv:
         with open(args.csv, "w") as f:
             f.write("dev,ino,filename,bitmap_pages,bitmap_raw_rows,filemap_pages,both_pages,"
-                     "filemap_only_pages,filemap_only_fraction,bitmap_only_pages,bitmap_only_fraction\n")
+                     "filemap_only_pages,filemap_only_fraction,bitmap_only_pages,bitmap_only_fraction,"
+                     "add_processes,access_processes\n")
             for r in rows:
                 fn = str(r["filename"]).replace('"', '""')
+                add_procs_s = ";".join(r["addProcesses"]).replace('"', '""')
+                access_procs_s = ";".join(r["accessProcesses"]).replace('"', '""')
                 f.write(
                     f"{r['dev']},{r['ino']},\"{fn}\",{r['bitmapPages']},{r['bitmapRawRows']},"
                     f"{r['filemapPages']},{r['bothPages']},{r['filemapOnlyPages']},"
-                    f"{r['filemapOnlyFraction']},{r['bitmapOnlyPages']},{r['bitmapOnlyFraction']}\n"
+                    f"{r['filemapOnlyFraction']},{r['bitmapOnlyPages']},{r['bitmapOnlyFraction']},"
+                    f"\"{add_procs_s}\",\"{access_procs_s}\"\n"
                 )
         print(f"Wrote {os.path.abspath(args.csv)}", file=sys.stderr)
+
+    if args.sqlite_out:
+        table = args.sqlite_table or DEFAULT_BATCH_TABLE
+        write_sqlite_table(
+            args.sqlite_out, table, BATCH_SQLITE_COLUMNS,
+            [batch_row_to_sqlite_tuple(r) for r in rows],
+        )
+        print(f"Wrote table '{table}' in {os.path.abspath(args.sqlite_out)}", file=sys.stderr)
 
     return 0
 
@@ -582,6 +786,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
                    help="Single-file mode: sort order for the printed/exported missing-page list.")
     p.add_argument("--json", help="Write full result JSON to this path.")
     p.add_argument("--csv", help="Write the missing-page list (single-file) or file report (batch) as CSV.")
+    p.add_argument("--sqlite-out", help="Write the report into a table in this SQLite DB (created if missing).")
+    p.add_argument("--sqlite-table",
+                   help=f"Table name for --sqlite-out (default: '{DEFAULT_SINGLE_TABLE}' single-file / "
+                        f"'{DEFAULT_BATCH_TABLE}' batch). Overwrites an existing table of that name.")
     p.add_argument("--build-indices", action="store_true",
                    help="Create missing (dev,ino) indexes on bitmap/add/delete tables (one-time write).")
     return p.parse_args(argv)
