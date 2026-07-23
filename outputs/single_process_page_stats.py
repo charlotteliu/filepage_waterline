@@ -57,6 +57,11 @@ for the tracemalloc benchmark) without changing any result.
 Usage:
   python3 outputs/single_process_page_stats.py --db ftrace.db \
     --json single_owner_stats.json --csv single_owner_pages.csv
+
+  # Save the qualifying-page list as a table inside the source DB itself,
+  # so it can be queried/joined with SQL later:
+  python3 outputs/single_process_page_stats.py --db ftrace.db \
+    --db-table single_owner_unmapped_pages
 """
 
 import argparse
@@ -180,6 +185,38 @@ def build_timestamp_indexes(db_path: str, use_access: bool) -> None:
                 continue
             print(f"Building timestamp index on {table} (one-time)...", file=sys.stderr)
             wconn.execute(f"CREATE INDEX IF NOT EXISTS ix_{table}_ts ON {table}(timestamp)")
+        wconn.commit()
+    finally:
+        wconn.close()
+
+
+DB_TABLE_COLUMNS = [
+    ("dev", "TEXT"), ("ino", "TEXT"), ("ofs", "INTEGER"), ("page_idx", "INTEGER"),
+    ("filename", "TEXT"), ("max_mmapcnt", "INTEGER"),
+    ("owning_process", "TEXT"), ("owner_source", "TEXT"),
+    ("in_add", "INTEGER"), ("in_bitmap", "INTEGER"),
+]
+
+
+def row_to_db_tuple(r: dict) -> tuple:
+    return (
+        r["dev"], r["ino"], r["ofs"], r["pageIdx"], r["filename"],
+        r["maxMmapcnt"], r["owningProcess"], r["ownerSource"],
+        1 if r["inAdd"] else 0, 1 if r["inBitmap"] else 0,
+    )
+
+
+def write_db_table(db_path: str, table: str, row_tuples: List[tuple]) -> None:
+    """(Re)creates `table` in db_path and bulk-inserts row_tuples. Overwrites
+    any existing table of the same name (DROP+CREATE) so repeated runs stay
+    a fresh snapshot rather than an ever-growing append."""
+    wconn = connect(db_path, writable=True)
+    try:
+        col_defs = ", ".join(f"{name} {sql_type}" for name, sql_type in DB_TABLE_COLUMNS)
+        wconn.execute(f"DROP TABLE IF EXISTS {table}")
+        wconn.execute(f"CREATE TABLE {table} ({col_defs})")
+        placeholders = ", ".join("?" for _ in DB_TABLE_COLUMNS)
+        wconn.executemany(f"INSERT INTO {table} VALUES ({placeholders})", row_tuples)
         wconn.commit()
     finally:
         wconn.close()
@@ -402,6 +439,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--top", type=int, default=25, help="How many qualifying pages to print (default 25).")
     p.add_argument("--json", help="Write full result JSON to this path.")
     p.add_argument("--csv", help="Write the qualifying-page list as CSV to this path.")
+    p.add_argument("--db-table",
+                   help="Write the qualifying-page list into this table in --db itself "
+                        "(created/overwritten via DROP+CREATE, one-time write to the source DB).")
     p.add_argument("--build-indices", action="store_true",
                    help="Create missing timestamp indexes (writes to DB, one-time; only helps --start/--end).")
     return p.parse_args(argv)
@@ -418,7 +458,7 @@ def main(argv: Sequence[str]) -> int:
     print("Scanning add/delete/bitmap" + ("/access" if args.use_access else "") + " tables...", file=sys.stderr)
     agg, anomalies = collect(conn, args.start, args.end, args.use_access)
 
-    need_full_export = bool(args.json or args.csv)
+    need_full_export = bool(args.json or args.csv or args.db_table)
     stats = analyze(agg, keep_limit=None if need_full_export else args.top)
     qualifying_rows = stats.pop("_qualifying_rows")
     del agg  # the aggregate can be tens of GB on large DBs; drop it before any reporting work
@@ -471,6 +511,11 @@ def main(argv: Sequence[str]) -> int:
                     f"{r['maxMmapcnt']},{r['owningProcess']},{r['ownerSource']},{r['inAdd']},{r['inBitmap']}\n"
                 )
         print(f"Wrote {os.path.abspath(args.csv)}", file=sys.stderr)
+
+    if args.db_table:
+        write_db_table(args.db, args.db_table, [row_to_db_tuple(r) for r in qualifying_rows])
+        print(f"Wrote table '{args.db_table}' ({len(qualifying_rows):,} rows) in {os.path.abspath(args.db)}",
+              file=sys.stderr)
 
     return 0
 
