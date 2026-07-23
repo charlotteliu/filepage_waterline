@@ -11,7 +11,7 @@
 
 - [x] **全体（population）定义**：`mm_filemap_add_to_page_cache`（加载）∪ `bitmap_page_info`（bitmap 观测到）按 `(dev,ino,ofs)` 去重的并集。`delete`/`access` 表本身不产生新的全体成员，只用来补充已在全体里的页的 mmapcnt / 进程信息（否则窗口截断导致的孤立 delete/access 会污染"加载过的页"这个定义）。
 - [x] **mmapcnt=0 判定**：取该页在 add/delete/access 三张表里所有行的 `mmapcnt` 最大值，等于 0 才算。`bitmap_page_info` 没有 `mmapcnt` 字段，如果一个页只在 bitmap 里出现过（从未见过 add/delete/access），视为"无 mmapcnt 数据"，**不计入** mmapcnt=0 的候选集——因为它出现在 bitmap 里这件事本身就说明它当时是被 mmap 映射的，跟"未映射"矛盾，默认成 0 会得出错误结论。
-- [x] **"单一进程访问"判定**：汇总该页在 add + delete + access_history 三张表里的 `pid_name`，再加上 bitmap 快照自身携带的 `pid_name`（bitmap 记录的就是被追踪进程的地址空间，这个进程本身也应该算"碰过"这个页），去重后只剩 1 个才算。`--no-access` 可以把 access_history 排除出统计；`--no-bitmap-pid` 可以把 bitmap 自身的 pid_name 排除出统计——用于对比不同口径下结果的差异。
+- [x] **"单一进程访问"判定**（已按用户纠正修改，见下方"追加修正"）：优先级级联而非并集——如果该页有 `mm_filemap_access_history` 记录，只用 access 的 `pid_name` 集合判定；否则退回用 add 的；如果 add 和 access 都没有（只有 delete），才用 delete 的。bitmap 快照自身的 `pid_name` 从不参与统计。
 - [x] **性能**：不需要按时间戳做归并流式重建（不涉及驻留区间的状态机），只是对 4 张表各做一遍独立的全表扫描，按 `(dev,ino,ofs)` 聚合最大 mmapcnt + pid 集合即可；`--build-indices` 建 timestamp 索引仅用于加速 `--start`/`--end` 窗口过滤，不是必需。
 - [x] `--json`/`--csv` 导出全部命中页（dev/ino/ofs/pageIdx/filename/maxMmapcnt/owningProcess/inAdd/inBitmap）；文件名解析复用了 `bitmap_filemap_diff.py` 里验证过的「只用 ino 匹配 inode_mapping，同一 ino 在结果里挂多个 dev 时视为歧义、留空」的逻辑（原地复制了一份，本仓库脚本一贯不共享模块，各自独立）。
 - [x] 本开发日志 + 更新 `CLAUDE.md`（新增第 5 个工具条目）。
@@ -19,7 +19,7 @@
 ## 关键决定 / 假设
 
 - **加载 = add 事件**，不包含 delete（"加载"字面意思就是被读入 page cache，对应 `mm_filemap_add_to_page_cache`）。
-- **触碰=进程集合的口径**：add + delete + access_history + bitmap 自身 pid，四个来源全算。如果只想看"谁写入/加载了它"而不管谁访问过，可以用 `--no-access` 排除 access_history；这不是本次默认行为，因为题目说的是"被访问"，倾向于口径更宽。
+- **触碰=进程集合的口径**（已按用户纠正）：access > add > delete 优先级级联，不是并集；bitmap 自身 pid 永不参与。详见下方"追加修正"。
 - delete/access 表里如果出现一个从未在 add 或 bitmap 里见过的 `(dev,ino,ofs)`（多半是窗口截断——页在窗口开始前就已加载，本次窗口只看到它被删除/访问），不计入全体，但计成 anomaly（`delete_without_add_or_bitmap` / `access_without_add_or_bitmap`），在 stderr/JSON 里报出来，不静默丢弃。
 
 ## 运行方式
@@ -53,5 +53,34 @@ python3 outputs/single_process_page_stats.py --db ftrace.db \
 
 ## 后续可做
 
-- 目前"触碰进程"口径是 add+delete+access+bitmap 四个来源全算，如果用户实际想要更窄/更宽的定义（比如只看 access，不看 add；或者反过来只看 add 不看 access），可以再加一个 `--touch-sources` 之类的开关直接枚举来源，而不是现在这样每个来源单独一个开关。
 - 目前只有全局统计 + 命中页明细，没有像 `bitmap_filemap_diff.py --all-bitmap-files` 那样按文件聚合"这个文件里有百分之多少的页是单一进程独占未映射"；如果这是常见需求，可以加一个按 `(dev,ino)` 聚合的第二张报表。
+
+## 追加修正：进程口径纠正
+
+用户指出初版的"触碰进程"定义有两处错误：
+
+1. **bitmap 快照的 `pid_name` 不是真正的访问者**——是抓取 bitmap 时跑的 `cat` 之类 shell 命令的 PID，跟这个页真正被谁访问毫无关系，不应该参与统计。初版把它并入进程集合是错的，直接删掉了这部分逻辑（连同 `--no-bitmap-pid` 开关一起移除，因为这个数据源本来就不该有开关，直接不用）。
+2. **"访问"应该是优先级级联，不是几个来源的并集**：有 access_history 记录就只看 access_history 的 `pid_name`（这才是真正意义上的"谁访问了这个页"）；没有 access_history 才退而求其次看 add 的 `pid_name`；add 和 access 都没有（只剩 delete）才用 delete 的。初版把 add/delete/access 全部揉在一个集合里求并集，会把"A 进程加载、B 进程访问"误判成"两个进程"——但如果有访问记录，加载者是谁并不重要，只有真正访问过的进程才算"owner"。
+
+### 修复
+
+- `outputs/single_process_page_stats.py` 里每个页的状态从一个共享 `pid_names` 集合拆成三个独立集合：`add_pids` / `delete_pids` / `access_pids`；bitmap 扫描不再读取、也不再写入任何 pid 信息。
+- 新增 `owning_pids(st)`：`access_pids` 非空就返回它；否则 `add_pids` 非空就返回它；否则返回 `delete_pids`（哪怕是空集）。"单一进程"判定改成 `len(owning_pids(st)) == 1`。
+- 命中页新增 `ownerSource` 字段（`access`/`add`/`delete`），标明这个页的 owner 是从哪个来源判定的，JSON/CSV/控制台输出都带上，方便核对。
+- `--no-access` 语义不变：跳过扫描 access_history 表，级联自然退到 add→delete。
+
+### 验证
+
+构造 5 个页覆盖级联的每一种落点，逐一核对：
+
+| 页 | 场景 | 预期 owner 来源 | 预期结果 |
+|---|---|---|---|
+| 0 | access 两个进程（X,Y）+ add 一个进程（A） | access | ❌ 不命中（access 侧 2 个进程） |
+| 1 | access 一个进程（Z）+ add 另一个不同进程（B） | access | ✅ 命中，owner=Z（add 的 B 被忽略） |
+| 2 | 无 access，add 一个进程（C）+ delete 另一个不同进程（D） | add | ✅ 命中，owner=C（delete 的 D 被忽略） |
+| 3 | 无 access 无 add，只有 delete（E）+ bitmap（进程"cat"） | delete | ✅ 命中，owner=E（bitmap 的 "cat" 被忽略） |
+| 4 | add 一个进程（F）+ bitmap 不同进程"cat" | add | ✅ 命中，owner=F（bitmap 的 "cat" 被忽略） |
+
+实际输出：全体=5，命中=4（页 1/2/3/4），`ownerSource` 分别是 access/add/delete/add，与预期完全一致；页 0 正确排除。`--no-access` 下页 0、页 1 都改用 add 的 pid（procA/procB）命中，全体=5、命中=5，符合级联退化预期。
+
+**真实文件重新验证**（`Camera_0030.db`）：全体不变（432,466，因为全体定义没有改动），命中数从旧口径的 209,344（48.41%）变为新口径的 251,432（58.14%）——口径变宽是预期的，因为新逻辑不再要求"add 和 access 都必须只有一个进程"，只看优先级最高的那个来源即可。

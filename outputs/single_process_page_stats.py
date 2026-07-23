@@ -19,10 +19,16 @@ Field semantics (see CLAUDE.md for the full schema):
     mmapcnt data — since bitmap membership itself means "currently
     mmap-mapped", such a page is excluded from the mmapcnt==0 cohort
     rather than defaulted to 0.
-  - "Touched by a process" = the page's `pid_name` from add, delete,
-    access-history, *and* the bitmap snapshot's own pid_name (the process
-    whose address space that bitmap belongs to) — `--no-access` /
-    `--no-bitmap-pid` narrow this if you want a stricter/looser definition.
+  - The bitmap snapshot's `pid_name` is the PID of the `cat`-style shell
+    command that dumped the bitmap, not a real accessor — it is never
+    counted as a touching process.
+  - "Touched by a process" is a priority cascade, not a union: if the page
+    has any `mm_filemap_access_history` rows, its owning process set is
+    the `pid_name`s from *those rows only*; else if it has any add rows,
+    the set is add's `pid_name`s; else (add- and access-less, delete only)
+    the set is delete's `pid_name`s. `--no-access` removes access-history
+    from consideration (falls through to add, then delete) if you want a
+    stricter/looser definition.
 
 Usage:
   python3 outputs/single_process_page_stats.py --db ftrace.db \
@@ -46,8 +52,20 @@ INODE_TABLE = "inode_mapping"
 PAGE_SIZE = 4096
 PageKey = Tuple[str, str, int]
 
-# Per-page aggregate: [in_add, in_bitmap, max_mmapcnt, has_mmapcnt_data, pid_names]
-P_IN_ADD, P_IN_BITMAP, P_MMAPCNT, P_HAS_MMAPCNT, P_PIDS = range(5)
+# Per-page aggregate: [in_add, in_bitmap, max_mmapcnt, has_mmapcnt_data,
+#                       add_pids, delete_pids, access_pids]
+(P_IN_ADD, P_IN_BITMAP, P_MMAPCNT, P_HAS_MMAPCNT,
+ P_ADD_PIDS, P_DEL_PIDS, P_ACCESS_PIDS) = range(7)
+
+
+def owning_pids(st: list) -> Set[str]:
+    """Priority cascade: access-history pid_names win if any exist, else
+    add's, else (add- and access-less) delete's. Not a union."""
+    if st[P_ACCESS_PIDS]:
+        return st[P_ACCESS_PIDS]
+    if st[P_ADD_PIDS]:
+        return st[P_ADD_PIDS]
+    return st[P_DEL_PIDS]
 
 
 def connect(db_path: str, writable: bool = False) -> sqlite3.Connection:
@@ -148,7 +166,7 @@ def _time_where(start: Optional[float], end: Optional[float]) -> Tuple[str, List
 def collect(
     conn: sqlite3.Connection,
     start: Optional[float], end: Optional[float],
-    use_access: bool, use_bitmap_pid: bool,
+    use_access: bool,
 ) -> Tuple[Dict[PageKey, list], collections.Counter]:
     agg: Dict[PageKey, list] = {}
     anomalies: collections.Counter = collections.Counter()
@@ -156,28 +174,25 @@ def collect(
     def get(key: PageKey) -> list:
         st = agg.get(key)
         if st is None:
-            st = [False, False, 0, False, set()]
+            st = [False, False, 0, False, set(), set(), set()]
             agg[key] = st
         return st
 
     where, params = _time_where(start, end)
 
-    # bitmap first: population membership + (optionally) the traced process's pid_name.
-    cur = conn.execute(f"SELECT dev, ino, page_ofs, pid_name FROM {BITMAP_TABLE} {where}", params)
+    # bitmap: population membership only. Its pid_name is the shell command
+    # (e.g. `cat`) that dumped the bitmap, not a real accessor -> never
+    # counted as a touching process.
+    cur = conn.execute(f"SELECT dev, ino, page_ofs FROM {BITMAP_TABLE} {where}", params)
     while True:
         rows = cur.fetchmany(50000)
         if not rows:
             break
         for r in rows:
             key = (str(r["dev"]), str(r["ino"]), int(r["page_ofs"]))
-            st = get(key)
-            st[P_IN_BITMAP] = True
-            if use_bitmap_pid:
-                pid_name = str(r["pid_name"] or "")
-                if pid_name:
-                    st[P_PIDS].add(pid_name)
+            get(key)[P_IN_BITMAP] = True
 
-    # add: population membership + mmapcnt + pid.
+    # add: population membership + mmapcnt + pid (fallback owner source).
     cur = conn.execute(f"SELECT dev, ino, ofs, mmapcnt, pid_name FROM {ADD_TABLE} {where}", params)
     while True:
         rows = cur.fetchmany(50000)
@@ -191,9 +206,10 @@ def collect(
             st[P_MMAPCNT] = max(st[P_MMAPCNT], int(r["mmapcnt"] or 0))
             pid_name = str(r["pid_name"] or "")
             if pid_name:
-                st[P_PIDS].add(pid_name)
+                st[P_ADD_PIDS].add(pid_name)
 
-    # delete: enrich mmapcnt/pid only (does not, by itself, define population).
+    # delete: enrich mmapcnt + pid (last-resort owner source); does not, by
+    # itself, define population.
     if table_exists(conn, DELETE_TABLE):
         cur = conn.execute(f"SELECT dev, ino, ofs, mmapcnt, pid_name FROM {DELETE_TABLE} {where}", params)
         while True:
@@ -210,9 +226,10 @@ def collect(
                 st[P_MMAPCNT] = max(st[P_MMAPCNT], int(r["mmapcnt"] or 0))
                 pid_name = str(r["pid_name"] or "")
                 if pid_name:
-                    st[P_PIDS].add(pid_name)
+                    st[P_DEL_PIDS].add(pid_name)
 
-    # access_history: enrich mmapcnt/pid only, same as delete.
+    # access_history: enrich mmapcnt + pid; when present, its pids are the
+    # sole owner source (see owning_pids()), same as delete otherwise.
     if use_access and table_exists(conn, ACCESS_TABLE):
         cur = conn.execute(f"SELECT dev, ino, ofs, mmapcnt, pid_name FROM {ACCESS_TABLE} {where}", params)
         while True:
@@ -229,7 +246,7 @@ def collect(
                 st[P_MMAPCNT] = max(st[P_MMAPCNT], int(r["mmapcnt"] or 0))
                 pid_name = str(r["pid_name"] or "")
                 if pid_name:
-                    st[P_PIDS].add(pid_name)
+                    st[P_ACCESS_PIDS].add(pid_name)
 
     return agg, anomalies
 
@@ -255,7 +272,7 @@ def analyze(agg: Dict[PageKey, list]) -> dict:
             no_mmapcnt_data += 1
             continue  # bitmap-only page: no mmapcnt data -> can't be "mmapcnt==0"
 
-        if st[P_MMAPCNT] == 0 and len(st[P_PIDS]) == 1:
+        if st[P_MMAPCNT] == 0 and len(owning_pids(st)) == 1:
             qualifying.append(key)
 
     qual_count = len(qualifying)
@@ -287,11 +304,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--end", type=float, help="End timestamp filter.")
     p.add_argument("--page-size", type=int, default=PAGE_SIZE, help="Page size in bytes (default 4096).")
     p.add_argument("--no-access", dest="use_access", action="store_false",
-                   help="Don't use mm_filemap_access_history for mmapcnt/pid enrichment.")
+                   help="Don't use mm_filemap_access_history at all (owner falls through to add, then delete).")
     p.set_defaults(use_access=True)
-    p.add_argument("--no-bitmap-pid", dest="use_bitmap_pid", action="store_false",
-                   help="Don't count a bitmap snapshot's pid_name as a touching process.")
-    p.set_defaults(use_bitmap_pid=True)
     p.add_argument("--top", type=int, default=25, help="How many qualifying pages to print (default 25).")
     p.add_argument("--json", help="Write full result JSON to this path.")
     p.add_argument("--csv", help="Write the qualifying-page list as CSV to this path.")
@@ -309,7 +323,7 @@ def main(argv: Sequence[str]) -> int:
     require_tables(conn)
 
     print("Scanning add/delete/bitmap" + ("/access" if args.use_access else "") + " tables...", file=sys.stderr)
-    agg, anomalies = collect(conn, args.start, args.end, args.use_access, args.use_bitmap_pid)
+    agg, anomalies = collect(conn, args.start, args.end, args.use_access)
     stats = analyze(agg)
     qualifying_keys = stats.pop("_qualifying_keys")
 
@@ -331,28 +345,29 @@ def main(argv: Sequence[str]) -> int:
     def qual_row(key: PageKey) -> dict:
         dev, ino, ofs = key
         st = agg[key]
-        pid = next(iter(st[P_PIDS]), "")
+        pid = next(iter(owning_pids(st)), "")
+        owner_source = "access" if st[P_ACCESS_PIDS] else ("add" if st[P_ADD_PIDS] else "delete")
         return {
             "dev": dev, "ino": ino, "ofs": ofs, "pageIdx": ofs // args.page_size,
             "filename": filenames.get((dev, ino), ""),
-            "maxMmapcnt": st[P_MMAPCNT], "owningProcess": pid,
+            "maxMmapcnt": st[P_MMAPCNT], "owningProcess": pid, "ownerSource": owner_source,
             "inAdd": st[P_IN_ADD], "inBitmap": st[P_IN_BITMAP],
         }
 
     if qualifying_keys:
         print("", file=sys.stderr)
         print(f"Top {min(args.top, len(qualifying_keys))} single-owner unmapped pages:", file=sys.stderr)
-        header = f"{'dev':>8} {'ino':>12} {'ofs':>12} {'pageIdx':>9}  owningProcess  filename"
+        header = f"{'dev':>8} {'ino':>12} {'ofs':>12} {'pageIdx':>9}  owningProcess(source)  filename"
         print(header, file=sys.stderr)
         for key in qualifying_keys[: args.top]:
             r = qual_row(key)
             print(f"{r['dev']:>8} {r['ino']:>12} {r['ofs']:>12} {r['pageIdx']:>9}  "
-                  f"{r['owningProcess']}  {r['filename']}", file=sys.stderr)
+                  f"{r['owningProcess']}({r['ownerSource']})  {r['filename']}", file=sys.stderr)
 
     if args.json:
         stats["params"] = {
             "start": args.start, "end": args.end, "pageSize": args.page_size,
-            "useAccess": args.use_access, "useBitmapPid": args.use_bitmap_pid,
+            "useAccess": args.use_access,
         }
         stats["anomalies"] = dict(anomalies)
         stats["qualifyingPages"] = [qual_row(k) for k in qualifying_keys]
@@ -362,13 +377,13 @@ def main(argv: Sequence[str]) -> int:
 
     if args.csv:
         with open(args.csv, "w") as f:
-            f.write("dev,ino,ofs,page_idx,filename,max_mmapcnt,owning_process,in_add,in_bitmap\n")
+            f.write("dev,ino,ofs,page_idx,filename,max_mmapcnt,owning_process,owner_source,in_add,in_bitmap\n")
             for key in qualifying_keys:
                 r = qual_row(key)
                 fn = str(r["filename"]).replace('"', '""')
                 f.write(
                     f"{r['dev']},{r['ino']},{r['ofs']},{r['pageIdx']},\"{fn}\","
-                    f"{r['maxMmapcnt']},{r['owningProcess']},{r['inAdd']},{r['inBitmap']}\n"
+                    f"{r['maxMmapcnt']},{r['owningProcess']},{r['ownerSource']},{r['inAdd']},{r['inBitmap']}\n"
                 )
         print(f"Wrote {os.path.abspath(args.csv)}", file=sys.stderr)
 
