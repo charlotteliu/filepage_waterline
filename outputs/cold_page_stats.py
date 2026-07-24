@@ -17,6 +17,12 @@ Cold-page "spacetime" (space x time) is accumulated in page-seconds:
 Average cold-page space = total cold spacetime / test duration, i.e. the mean
 number of cold pages (and bytes) resident across the whole test window.
 
+Average *resident* space (all closed intervals, not just cold ones) is
+computed the same way from each interval's full (delete_ts - add_ts)
+duration: total resident spacetime / test duration. Cold space's fraction of
+that average resident space (averageColdSpace.fractionOfAverageResident)
+shows how much of the "typical" resident footprint at any instant is cold.
+
 Only closed add->delete intervals are counted (a delete is required). Pages
 still resident at the end of the window are reported separately, not counted.
 """
@@ -239,6 +245,7 @@ def analyze(
     cold0 = 0
     cold1 = 0
     cold_spacetime = 0.0  # page-seconds
+    total_spacetime = 0.0  # page-seconds, every closed interval (not just cold ones)
     # per file: [cold_page_count, cold_spacetime_page_seconds]
     per_file: dict = collections.defaultdict(lambda: [0, 0.0])
     obs_min: Optional[float] = None
@@ -270,6 +277,8 @@ def analyze(
                 anomalies["delete_without_active_add"] += 1
                 continue
             closed += 1
+            full_dur = ts - st[A_ADD]
+            total_spacetime += full_dur if full_dur > 0 else 0.0
             acc = st[A_CNT]
             if acc <= 1:
                 if acc == 0:
@@ -297,6 +306,10 @@ def analyze(
     # Average cold-page footprint over the whole test window.
     avg_cold_pages = cold_spacetime / test_time
     avg_cold_bytes = avg_cold_pages * PAGE_SIZE
+    # Average *resident* footprint (all closed intervals) over the same window.
+    avg_resident_pages = total_spacetime / test_time
+    avg_resident_bytes = avg_resident_pages * PAGE_SIZE
+    cold_fraction_of_resident = (avg_cold_pages / avg_resident_pages) if avg_resident_pages > 0 else 0.0
 
     return {
         "params": {
@@ -320,11 +333,20 @@ def analyze(
             "coldPageSeconds": round(cold_spacetime, 6),
             "coldByteSeconds": round(cold_spacetime * PAGE_SIZE, 3),
             "coldPageMBSeconds": round(cold_spacetime * PAGE_SIZE / (1024 * 1024), 6),
+            "residentPageSeconds": round(total_spacetime, 6),
+            "residentByteSeconds": round(total_spacetime * PAGE_SIZE, 3),
+            "residentPageMBSeconds": round(total_spacetime * PAGE_SIZE / (1024 * 1024), 6),
         },
         "averageColdSpace": {
             "pages": round(avg_cold_pages, 4),
             "bytes": round(avg_cold_bytes, 2),
             "MB": round(avg_cold_bytes / (1024 * 1024), 4),
+            "fractionOfAverageResident": round(cold_fraction_of_resident, 6),
+        },
+        "averageResidentSpace": {
+            "pages": round(avg_resident_pages, 4),
+            "bytes": round(avg_resident_bytes, 2),
+            "MB": round(avg_resident_bytes / (1024 * 1024), 4),
         },
         "anomalies": dict(anomalies),
         "_per_file": per_file,
@@ -390,6 +412,7 @@ def main(argv: Sequence[str]) -> int:
     iv = stats["intervals"]
     sp = stats["spacetime"]
     av = stats["averageColdSpace"]
+    ar = stats["averageResidentSpace"]
     pr = stats["params"]
     print("", file=sys.stderr)
     print(f"Test window        : {pr['start']:.6f}..{pr['end']:.6f}  "
@@ -401,8 +424,11 @@ def main(argv: Sequence[str]) -> int:
     print(f"Still resident @end : {iv['stillResidentAtEnd']:,} (excluded)", file=sys.stderr)
     print(f"Cold spacetime     : {sp['coldPageSeconds']:,.3f} page-s  "
           f"({sp['coldPageMBSeconds']:,.3f} MB-s)", file=sys.stderr)
+    print(f"Avg resident space : {ar['pages']:,.2f} pages  "
+          f"({ar['MB']:,.3f} MB) resident on average (all closed intervals)", file=sys.stderr)
     print(f"Avg cold space     : {av['pages']:,.2f} pages  "
-          f"({av['MB']:,.3f} MB) resident-cold on average", file=sys.stderr)
+          f"({av['MB']:,.3f} MB) resident-cold on average  "
+          f"({av['fractionOfAverageResident']*100:.1f}% of avg resident space)", file=sys.stderr)
     if stats["anomalies"]:
         print(f"Anomalies          : {stats['anomalies']}", file=sys.stderr)
 
